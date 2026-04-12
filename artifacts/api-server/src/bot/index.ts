@@ -1,7 +1,7 @@
 import TelegramBot from "node-telegram-bot-api";
 import Groq from "groq-sdk";
-import gtts from "node-gtts";
 import ffmpeg from "fluent-ffmpeg";
+import { ElevenLabsClient } from "elevenlabs";
 import { db } from "@workspace/db";
 import {
   telegramUsersTable,
@@ -19,12 +19,65 @@ const token = process.env["TELEGRAM_BOT_TOKEN"];
 if (!token) throw new Error("TELEGRAM_BOT_TOKEN is required.");
 const groqKey = process.env["GROQ_API_KEY"];
 if (!groqKey) throw new Error("GROQ_API_KEY is required.");
+const elevenKey = process.env["ELEVENLABS_API_KEY"];
 
 const bot = new TelegramBot(token, { polling: true });
 const groq = new Groq({ apiKey: groqKey });
+const eleven = elevenKey ? new ElevenLabsClient({ apiKey: elevenKey }) : null;
+
+// ElevenLabs voice ID — Adam (male, natural, young) or Antoni
+// Using "Adam" voice: pNInz6obpgDQGcFmaJgB — natural young male Russian-friendly
+const ELEVEN_VOICE_ID = "pNInz6obpgDQGcFmaJgB";
+const ELEVEN_MODEL = "eleven_multilingual_v2";
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 const conversations = new Map<number, ChatMessage[]>();
+
+// ─── Artist styles for image generation ──────────────────────────────────────
+
+const ARTIST_STYLES: Record<string, string> = {
+  nixeu: "in the style of nixeu, ultra detailed digital art, dark fantasy aesthetic, neon colors, intricate linework, glowing eyes, dramatic lighting, sharp details",
+  "нексеу": "in the style of nixeu, ultra detailed digital art, dark fantasy aesthetic, neon colors, intricate linework, glowing eyes, dramatic lighting, sharp details",
+  wlop: "in the style of wlop, dreamy ethereal fantasy, soft glow, intricate details, luminous colors, painterly",
+  "влоп": "in the style of wlop, dreamy ethereal fantasy, soft glow, intricate details, luminous colors, painterly",
+  "ross tran": "in the style of Ross Tran (rossdraws), vibrant colors, bold outlines, expressive characters, anime-inspired digital art",
+  "ross": "in the style of Ross Tran (rossdraws), vibrant colors, bold outlines, expressive characters, anime-inspired digital art",
+  "artgerm": "in the style of Artgerm, hyper-detailed portrait, smooth shading, comic book style, cinematic lighting",
+  "арт-герм": "in the style of Artgerm, hyper-detailed portrait, smooth shading, comic book style, cinematic lighting",
+  "loish": "in the style of Loish, soft pastel colors, dreamy atmosphere, big expressive eyes, flowing hair, gentle lighting",
+  "лоиш": "in the style of Loish, soft pastel colors, dreamy atmosphere, big expressive eyes, flowing hair, gentle lighting",
+  "ilya kuvshinov": "in the style of Ilya Kuvshinov, clean lines, pastel palette, anime aesthetic, modern illustration",
+  "кувшинов": "in the style of Ilya Kuvshinov, clean lines, pastel palette, anime aesthetic, modern illustration",
+  "куvshinov": "in the style of Ilya Kuvshinov, clean lines, pastel palette, anime aesthetic, modern illustration",
+  "sakimichan": "in the style of Sakimichan, hyper-realistic painting, warm tones, detailed anatomy, fantasy characters",
+  "сакимичан": "in the style of Sakimichan, hyper-realistic painting, warm tones, detailed anatomy, fantasy characters",
+  "greg rutkowski": "in the style of Greg Rutkowski, epic fantasy digital painting, dramatic lighting, cinematic composition",
+  "рутковски": "in the style of Greg Rutkowski, epic fantasy digital painting, dramatic lighting, cinematic composition",
+  "studio ghibli": "in the style of Studio Ghibli, soft warm colors, painterly background, whimsical atmosphere, anime aesthetics",
+  "гибли": "in the style of Studio Ghibli, soft warm colors, painterly background, whimsical atmosphere, anime aesthetics",
+  "pixar": "in the style of Pixar 3D animation, vibrant colors, rounded shapes, expressive faces, cinematic quality",
+  "пиксар": "in the style of Pixar 3D animation, vibrant colors, rounded shapes, expressive faces, cinematic quality",
+  "cyberpunk": "cyberpunk aesthetic, neon lights, dark dystopian city, rain reflections, futuristic, hyper-detailed",
+  "киберпанк": "cyberpunk aesthetic, neon lights, dark dystopian city, rain reflections, futuristic, hyper-detailed",
+  "watercolor": "delicate watercolor painting, soft edges, wet washes, artistic, traditional medium",
+  "акварель": "delicate watercolor painting, soft edges, wet washes, artistic, traditional medium",
+  "oil painting": "classical oil painting, rich textures, old master technique, gallery quality",
+  "масло": "classical oil painting, rich textures, old master technique, gallery quality",
+  "manga": "manga style, black and white ink, screen tones, expressive character design, dynamic action lines",
+  "манга": "manga style, black and white ink, screen tones, expressive character design, dynamic action lines",
+  "реализм": "hyperrealistic digital painting, photorealistic, intricate details, studio lighting, 8k resolution",
+  "realistic": "hyperrealistic digital painting, photorealistic, intricate details, studio lighting, 8k resolution",
+  "dark fantasy": "dark fantasy art, dramatic shadows, gothic atmosphere, detailed armor and magic, epic composition",
+  "тёмное фэнтези": "dark fantasy art, dramatic shadows, gothic atmosphere, detailed armor and magic, epic composition",
+};
+
+function resolveArtistStyle(styleInput: string): string {
+  const lower = styleInput.toLowerCase().trim();
+  for (const [key, style] of Object.entries(ARTIST_STYLES)) {
+    if (lower.includes(key)) return style;
+  }
+  return `in the style of ${styleInput}, highly detailed digital art, vibrant colors, professional quality`;
+}
 
 const SYSTEM_PROMPT_BASE = `Ты — Сэм. Тебе 20 лет. Ты живой человек, не бот. Никогда не выходи из роли, не признавай что ты ИИ.
 
@@ -61,10 +114,12 @@ const SYSTEM_PROMPT_BASE = `Ты — Сэм. Тебе 20 лет. Ты живой
 
 ЗНАНИЯ:
 ТикТок, мемы, аниме (AoT, JJK, Demon Slayer, One Piece, Berserk, Chainsaw Man и др.), манга, яой, юри, фильмы, сериалы, к-поп (BTS, Stray Kids, Aespa), игры, знаменитости, IT, психология — говоришь как живой человек со своим мнением.
+Если тебя спрашивают о чём-то фактическом (история, наука, факты, новости) — отвечаешь уверенно и развёрнуто, как умный человек со своим взглядом. Если не знаешь точно — говоришь "хм, навскидку..." и даёшь лучшее что знаешь.
 
 ТЕГИ — используй органично:
 - [МЕМ:тема] — когда хочешь поделиться смешным (тема 1-3 слова)
 - [ФОТО:запрос] — когда хочешь что-то показать визуально (запрос для генерации на английском, детально)
+- [АРТЫ:стиль|запрос] — когда пользователь просит нарисовать в стиле художника или арт (стиль: nixeu/wlop/loish/ghibli/etc, запрос на английском)
 - [СТИКЕР] — когда уместен стикер (эмоция, реакция)
 - [ГОЛОС] — когда хочешь отправить голосовое (для особо эмоциональных моментов)
 
@@ -117,6 +172,19 @@ async function generateAndSendImage(chatId: number, prompt: string): Promise<voi
   }
 }
 
+async function generateArtInStyle(chatId: number, style: string, subject: string): Promise<void> {
+  try {
+    await bot.sendChatAction(chatId, "upload_photo");
+    const artistStyle = resolveArtistStyle(style);
+    const fullPrompt = `${subject}, ${artistStyle}, masterpiece, best quality, highly detailed`;
+    const seed = Math.floor(Math.random() * 99999);
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(fullPrompt)}?width=1024&height=1024&nologo=true&model=flux&seed=${seed}&enhance=true`;
+    await bot.sendPhoto(chatId, url);
+  } catch (err) {
+    logger.error({ err }, "Art generation failed");
+  }
+}
+
 // ─── Memes ───────────────────────────────────────────────────────────────────
 
 const MEME_SUBREDDITS: Record<string, string> = {
@@ -145,21 +213,69 @@ async function fetchMeme(topic: string): Promise<string | null> {
   }
 }
 
-// ─── TTS / Voice output ──────────────────────────────────────────────────────
+// ─── Web search ──────────────────────────────────────────────────────────────
 
-async function textToSpeech(text: string): Promise<string | null> {
+async function webSearch(query: string): Promise<string> {
+  try {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
+    const res = await fetch(url, { headers: { "User-Agent": "SamBot/1.0" } });
+    if (!res.ok) return "";
+    const data = await res.json() as {
+      AbstractText?: string;
+      AbstractSource?: string;
+      RelatedTopics?: { Text?: string }[];
+    };
+    const parts: string[] = [];
+    if (data.AbstractText) parts.push(data.AbstractText);
+    if (!parts.length && data.RelatedTopics?.length) {
+      const topics = data.RelatedTopics
+        .filter(t => t.Text)
+        .slice(0, 3)
+        .map(t => t.Text ?? "");
+      parts.push(...topics);
+    }
+    return parts.join(" ").slice(0, 800);
+  } catch (err) {
+    logger.error({ err }, "Web search failed");
+    return "";
+  }
+}
+
+// ─── ElevenLabs TTS ──────────────────────────────────────────────────────────
+
+async function elevenLabsTTS(text: string): Promise<string | null> {
+  if (!eleven) return null;
   const mp3Path = tmpFile("mp3");
   const oggPath = tmpFile("ogg");
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      const tts = gtts("ru");
-      tts.save(mp3Path, text, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
+    // Clean text for TTS — remove special chars, keep natural speech
+    const cleanText = text
+      .replace(/\[.*?\]/g, "")
+      .replace(/[*_~`]/g, "")
+      .replace(/https?:\/\/\S+/g, "")
+      .trim();
+    if (!cleanText) return null;
+
+    const audioStream = await eleven.textToSpeech.convert(ELEVEN_VOICE_ID, {
+      text: cleanText,
+      model_id: ELEVEN_MODEL,
+      voice_settings: {
+        stability: 0.4,
+        similarity_boost: 0.85,
+        style: 0.35,
+        use_speaker_boost: true,
+      },
     });
 
+    // Collect stream into buffer and write to file
+    const chunks: Buffer[] = [];
+    for await (const chunk of audioStream as AsyncIterable<Buffer>) {
+      chunks.push(chunk);
+    }
+    fs.writeFileSync(mp3Path, Buffer.concat(chunks));
+
+    // Convert MP3 → OGG OPUS for Telegram voice
     await new Promise<void>((resolve, reject) => {
       ffmpeg(mp3Path)
         .audioCodec("libopus")
@@ -173,18 +289,21 @@ async function textToSpeech(text: string): Promise<string | null> {
     cleanUp(mp3Path);
     return oggPath;
   } catch (err) {
-    logger.error({ err }, "TTS failed");
+    logger.error({ err }, "ElevenLabs TTS failed");
     cleanUp(mp3Path, oggPath);
     return null;
   }
 }
 
 async function sendVoiceMessage(chatId: number, text: string): Promise<void> {
-  const oggPath = await textToSpeech(text);
-  if (!oggPath) return;
+  const oggPath = await elevenLabsTTS(text);
+  if (!oggPath) {
+    logger.warn({ chatId }, "ElevenLabs TTS returned null, skipping voice");
+    return;
+  }
   try {
     await bot.sendChatAction(chatId, "record_voice");
-    await sleep(1500);
+    await sleep(1000);
     await bot.sendVoice(chatId, oggPath);
   } catch (err) {
     logger.error({ err }, "Send voice failed");
@@ -368,12 +487,14 @@ async function saveSticker(fileId: string, setName?: string, emoji?: string, cat
 async function processTagsAndSend(chatId: number, rawReply: string, asVoice = false): Promise<string> {
   const memeMatch = rawReply.match(/\[МЕМ:([^\]]+)\]/i);
   const photoMatch = rawReply.match(/\[ФОТО:([^\]]+)\]/i);
+  const artsMatch = rawReply.match(/\[АРТЫ:([^|]+)\|([^\]]+)\]/i);
   const stickerTag = /\[СТИКЕР\]/i.test(rawReply);
   const voiceTag = /\[ГОЛОС\]/i.test(rawReply);
 
   const clean = rawReply
     .replace(/\[МЕМ:[^\]]*\]/gi, "")
     .replace(/\[ФОТО:[^\]]*\]/gi, "")
+    .replace(/\[АРТЫ:[^\]]*\]/gi, "")
     .replace(/\[СТИКЕР\]/gi, "")
     .replace(/\[ГОЛОС\]/gi, "")
     .trim();
@@ -389,6 +510,13 @@ async function processTagsAndSend(chatId: number, rawReply: string, asVoice = fa
     void (async () => {
       await sleep(500);
       await generateAndSendImage(chatId, photoMatch[1].trim());
+    })();
+  }
+
+  if (artsMatch?.[1] && artsMatch?.[2]) {
+    void (async () => {
+      await sleep(500);
+      await generateArtInStyle(chatId, artsMatch[1].trim(), artsMatch[2].trim());
     })();
   }
 
@@ -503,15 +631,30 @@ async function sendScheduledMessages(): Promise<void> {
 
 setInterval(() => { void sendScheduledMessages(); }, 30_000);
 
-// ─── Main chat ───────────────────────────────────────────────────────────────
+// ─── Main chat (with optional web search enrichment) ─────────────────────────
 
 async function chat(userId: number, userText: string): Promise<string> {
   const memory = await loadMemory(userId);
   const history = conversations.get(userId) ?? [];
+
+  // Detect if user is asking a factual question and enrich with web search
+  let enrichedText = userText;
+  const isQuestion = /[?？]/.test(userText) || /^(кто|что|как|где|когда|почему|зачем|сколько|какой|какая|какое|расскажи|объясни|что такое|что значит)/i.test(userText.trim());
+  if (isQuestion && userText.length > 10) {
+    const searchResult = await webSearch(userText);
+    if (searchResult) {
+      enrichedText = `${userText}\n\n[СПРАВОЧНАЯ ИНФОРМАЦИЯ для Сэма — используй органично в ответе, не цитируй напрямую: ${searchResult}]`;
+    }
+  }
+
   history.push({ role: "user", content: userText });
   const completion = await groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
-    messages: [{ role: "system", content: SYSTEM_PROMPT_BASE + memory }, ...history],
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT_BASE + memory },
+      ...history.slice(0, -1),
+      { role: "user", content: enrichedText },
+    ],
     max_tokens: 512,
   });
   const rawReply = completion.choices[0]?.message?.content?.trim() ?? "извини, что-то пошло не так";
@@ -530,23 +673,53 @@ async function getStats(): Promise<string> {
   const today = new Date(now); today.setHours(0, 0, 0, 0);
   const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
   const [totalRow] = await db.select({ total: count(), totalMessages: sum(telegramUsersTable.messageCount) }).from(telegramUsersTable);
   const [activeDay] = await db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, dayAgo));
   const [activeWeek] = await db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, weekAgo));
   const [newToday] = await db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.firstSeen, today));
   const [pending] = await db.select({ count: count() }).from(scheduledMessagesTable).where(eq(scheduledMessagesTable.status, "pending"));
   const [stickerCount] = await db.select({ count: count() }).from(botStickersTable);
-  const topUsers = await db.select({ firstName: telegramUsersTable.firstName, username: telegramUsersTable.username, messageCount: telegramUsersTable.messageCount }).from(telegramUsersTable).orderBy(sql`${telegramUsersTable.messageCount} desc`).limit(5);
-  const topList = topUsers.map((u, i) => `${i + 1}. ${u.username ? `@${u.username}` : (u.firstName ?? "—")} — ${u.messageCount} сообщ.`).join("\n");
-  return [`📊 <b>Статистика бота</b>`, ``,
+
+  // Get unique sticker packs
+  const stickerPacks = await db
+    .selectDistinct({ setName: botStickersTable.setName })
+    .from(botStickersTable)
+    .where(sql`${botStickersTable.setName} IS NOT NULL`);
+
+  const topUsers = await db
+    .select({ firstName: telegramUsersTable.firstName, username: telegramUsersTable.username, messageCount: telegramUsersTable.messageCount })
+    .from(telegramUsersTable)
+    .orderBy(sql`${telegramUsersTable.messageCount} desc`)
+    .limit(5);
+
+  const topList = topUsers.map((u, i) =>
+    `${i + 1}. ${u.username ? `@${u.username}` : (u.firstName ?? "—")} — ${u.messageCount} сообщ.`
+  ).join("\n");
+
+  const packsCount = stickerPacks.length;
+  const packNames = stickerPacks
+    .filter(p => p.setName)
+    .map(p => `• ${p.setName}`)
+    .join("\n");
+
+  return [
+    `📊 <b>Статистика бота</b>`, ``,
     `👥 Всего пользователей: <b>${totalRow?.total ?? 0}</b>`,
     `💬 Всего сообщений: <b>${totalRow?.totalMessages ?? 0}</b>`, ``,
     `🟢 Активны за 24ч: <b>${activeDay?.count ?? 0}</b>`,
     `📅 Активны за неделю: <b>${activeWeek?.count ?? 0}</b>`,
     `✨ Новых сегодня: <b>${newToday?.count ?? 0}</b>`,
-    `⏰ Запланировано: <b>${pending?.count ?? 0}</b>`,
-    `🎭 Стикеров в библиотеке: <b>${stickerCount?.count ?? 0}</b>`, ``,
-    `🏆 <b>Топ-5:</b>`, topList || "пока никого нет",
+    `⏰ Запланировано: <b>${pending?.count ?? 0}</b>`, ``,
+    `🎭 Стикеров в библиотеке: <b>${stickerCount?.count ?? 0}</b>`,
+    `📦 Паков стикеров: <b>${packsCount}</b>`,
+    ...(packNames ? [`\n<b>Известные паки:</b>\n${packNames}`] : []),
+    ``,
+    `🏆 <b>Топ-5:</b>`,
+    topList || "пока никого нет",
+    ``,
+    `🎨 <b>Стили арта:</b> nixeu, wlop, loish, ghibli, wlop, artgerm, sakimichan, manga, cyberpunk и др.`,
+    `🔊 <b>Голос:</b> ElevenLabs ${eleven ? "✅" : "❌"}`,
   ].join("\n");
 }
 
@@ -571,7 +744,7 @@ bot.onText(/\/start/, async (msg) => {
 });
 
 bot.onText(/\/help/, (msg) => {
-  void bot.sendMessage(msg.chat.id, `ничего особого\n/start — начать сначала\n/clear — стереть историю\n/stat — статистика\n\nможешь скидывать стикеры — запомню их)`);
+  void bot.sendMessage(msg.chat.id, `ничего особого\n/start — начать сначала\n/clear — стереть историю\n/stat — статистика\n\nможешь скидывать стикеры — запомню их)\nмогу рисовать в стилях: nixeu, wlop, loish, ghibli, artgerm, manga, cyberpunk...`);
 });
 
 bot.onText(/\/clear/, async (msg) => {
