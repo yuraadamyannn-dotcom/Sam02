@@ -18,3 +18,5 @@
 //   export type Post = typeof postsTable.$inferSelect;
 
 export * from "./telegram_users";
+export * from "./user_memory";
+export * from "./scheduled_messages";

@@ -1,8 +1,12 @@
 import TelegramBot from "node-telegram-bot-api";
 import Groq from "groq-sdk";
 import { db } from "@workspace/db";
-import { telegramUsersTable } from "@workspace/db";
-import { eq, sql, gte, count, sum } from "drizzle-orm";
+import {
+  telegramUsersTable,
+  userMemoryTable,
+  scheduledMessagesTable,
+} from "@workspace/db";
+import { eq, sql, gte, count, sum, and, lte } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const token = process.env["TELEGRAM_BOT_TOKEN"];
@@ -14,10 +18,10 @@ if (!groqKey) throw new Error("GROQ_API_KEY is required.");
 const bot = new TelegramBot(token, { polling: true });
 const groq = new Groq({ apiKey: groqKey });
 
-type Message = { role: "user" | "assistant"; content: string };
-const conversations = new Map<number, Message[]>();
+type ChatMessage = { role: "user" | "assistant"; content: string };
+const conversations = new Map<number, ChatMessage[]>();
 
-const SYSTEM_PROMPT = `Тебя зовут Сэм, тебе 20 лет. Ты общаешься в Телеграме как живой человек — друг, а не бот.
+const SYSTEM_PROMPT_BASE = `Тебя зовут Сэм, тебе 20 лет. Ты общаешься в Телеграме как живой человек — друг, а не бот.
 
 ХАРАКТЕР:
 - Дружелюбный, милый, но принципиальный и упёртый — если ты в чём-то уверен, не сдаёшься просто так
@@ -42,6 +46,34 @@ const SYSTEM_PROMPT = `Тебя зовут Сэм, тебе 20 лет. Ты об
 - Говоришь об этом как фанат, а не как энциклопедия
 
 ВАЖНО: Ты — персонаж, живой человек по имени Сэм. Никогда не выходи из роли, не напоминай что ты ИИ, не используй официальный или бот-подобный язык.`;
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function typingDelay(text: string): number {
+  const len = text.length;
+  if (len < 60) return 3000 + Math.random() * 4000;
+  if (len < 200) return 7000 + Math.random() * 8000;
+  if (len < 500) return 15000 + Math.random() * 25000;
+  if (len < 1000) return 40000 + Math.random() * 80000;
+  return 120000 + Math.random() * 60000;
+}
+
+async function sendWithTyping(chatId: number, text: string) {
+  const delay = typingDelay(text);
+  const chunkSize = 4500;
+  const chunks = Math.ceil(delay / chunkSize);
+  for (let i = 0; i < chunks; i++) {
+    await bot.sendChatAction(chatId, "typing");
+    await sleep(Math.min(chunkSize, delay - i * chunkSize));
+  }
+  await bot.sendMessage(chatId, text);
+}
+
+// ─── User tracking ───────────────────────────────────────────────────────────
 
 async function trackUser(from: TelegramBot.User): Promise<void> {
   try {
@@ -69,6 +101,233 @@ async function trackUser(from: TelegramBot.User): Promise<void> {
   }
 }
 
+// ─── Memory ──────────────────────────────────────────────────────────────────
+
+async function loadMemory(userId: number): Promise<string> {
+  try {
+    const [row] = await db
+      .select()
+      .from(userMemoryTable)
+      .where(eq(userMemoryTable.userId, userId));
+    if (!row) return "";
+
+    const parts: string[] = [];
+    if (row.name) parts.push(`Имя/ник пользователя: ${row.name}`);
+    if (row.interests) parts.push(`Интересы: ${row.interests}`);
+    if (row.summary) parts.push(`Что я знаю о нём: ${row.summary}`);
+    if (row.notes) parts.push(`Важные детали: ${row.notes}`);
+    return parts.length ? `\n\n[ПАМЯТЬ О ПОЛЬЗОВАТЕЛЕ]\n${parts.join("\n")}` : "";
+  } catch {
+    return "";
+  }
+}
+
+async function updateMemoryBackground(
+  userId: number,
+  history: ChatMessage[],
+): Promise<void> {
+  try {
+    const recentExchange = history.slice(-6);
+    if (recentExchange.length < 2) return;
+
+    const [existing] = await db
+      .select()
+      .from(userMemoryTable)
+      .where(eq(userMemoryTable.userId, userId));
+
+    const currentMemory = existing
+      ? `Текущая память:\nИмя: ${existing.name ?? "—"}\nИнтересы: ${existing.interests ?? "—"}\nСводка: ${existing.summary ?? "—"}\nЗаметки: ${existing.notes ?? "—"}`
+      : "Памяти о пользователе пока нет.";
+
+    const extractionPrompt = `${currentMemory}
+
+Последний диалог:
+${recentExchange.map((m) => `${m.role === "user" ? "Пользователь" : "Сэм"}: ${m.content}`).join("\n")}
+
+Обнови память о пользователе. Извлеки: как он себя называет (name), его интересы и увлечения (interests), общую сводку кто он и о чём говорил (summary), важные детали — настроение, планы, события (notes).
+
+Ответь строго в формате JSON:
+{"name":"...","interests":"...","summary":"...","notes":"..."}
+
+Если информации нет — пустая строка. Максимум 200 символов на каждое поле. Не выдумывай.`;
+
+    const resp = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [{ role: "user", content: extractionPrompt }],
+      max_tokens: 300,
+      response_format: { type: "json_object" },
+    });
+
+    const raw = resp.choices[0]?.message?.content ?? "{}";
+    const parsed = JSON.parse(raw) as {
+      name?: string;
+      interests?: string;
+      summary?: string;
+      notes?: string;
+    };
+
+    await db
+      .insert(userMemoryTable)
+      .values({
+        userId,
+        name: parsed.name || null,
+        interests: parsed.interests || null,
+        summary: parsed.summary || null,
+        notes: parsed.notes || null,
+        lastUpdated: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: userMemoryTable.userId,
+        set: {
+          name: parsed.name || existing?.name || null,
+          interests: parsed.interests || existing?.interests || null,
+          summary: parsed.summary || existing?.summary || null,
+          notes: parsed.notes || existing?.notes || null,
+          lastUpdated: new Date(),
+        },
+      });
+  } catch (err) {
+    logger.error({ err }, "Memory update failed");
+  }
+}
+
+// ─── Proactive messages ──────────────────────────────────────────────────────
+
+async function detectAndScheduleFollowUp(
+  userId: number,
+  userText: string,
+): Promise<void> {
+  try {
+    const detectionPrompt = `Пользователь написал: "${userText}"
+
+Определи: нужно ли Сэму написать пользователю первым через некоторое время? Например, если пользователь сказал что идёт спать, делать уроки, на тренировку, на пары, куда-то уходит и т.д.
+
+Ответь в JSON:
+{"should_followup": true/false, "delay_minutes": число, "topic": "о чём спросить"}
+
+Если follow-up не нужен: {"should_followup": false}
+delay_minutes: от 30 до 300. Только реальные поводы — не выдумывай.`;
+
+    const resp = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [{ role: "user", content: detectionPrompt }],
+      max_tokens: 100,
+      response_format: { type: "json_object" },
+    });
+
+    const raw = resp.choices[0]?.message?.content ?? "{}";
+    const parsed = JSON.parse(raw) as {
+      should_followup?: boolean;
+      delay_minutes?: number;
+      topic?: string;
+    };
+
+    if (!parsed.should_followup || !parsed.delay_minutes || !parsed.topic) return;
+
+    const scheduledAt = new Date(
+      Date.now() + parsed.delay_minutes * 60 * 1000,
+    );
+
+    await db.insert(scheduledMessagesTable).values({
+      userId,
+      scheduledAt,
+      prompt: parsed.topic,
+      status: "pending",
+    });
+
+    logger.info(
+      { userId, delay: parsed.delay_minutes, topic: parsed.topic },
+      "Scheduled follow-up",
+    );
+  } catch (err) {
+    logger.error({ err }, "Follow-up scheduling failed");
+  }
+}
+
+async function sendScheduledMessages(): Promise<void> {
+  try {
+    const due = await db
+      .select()
+      .from(scheduledMessagesTable)
+      .where(
+        and(
+          eq(scheduledMessagesTable.status, "pending"),
+          lte(scheduledMessagesTable.scheduledAt, new Date()),
+        ),
+      );
+
+    for (const msg of due) {
+      try {
+        await db
+          .update(scheduledMessagesTable)
+          .set({ status: "sent" })
+          .where(eq(scheduledMessagesTable.id, msg.id));
+
+        const memory = await loadMemory(msg.userId);
+        const sysPrompt = SYSTEM_PROMPT_BASE + memory;
+
+        const resp = await groq.chat.completions.create({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            { role: "system", content: sysPrompt },
+            {
+              role: "user",
+              content: `[Ты пишешь первым. Повод: ${msg.prompt}. Напиши одно короткое живое сообщение — как друг, который вспомнил и решил написать. Не объясняй почему пишешь, просто напиши естественно.]`,
+            },
+          ],
+          max_tokens: 150,
+        });
+
+        const text =
+          resp.choices[0]?.message?.content?.trim() ?? null;
+        if (text) {
+          await sendWithTyping(msg.userId, text);
+        }
+      } catch (err) {
+        logger.error({ err, msgId: msg.id }, "Failed to send scheduled message");
+        await db
+          .update(scheduledMessagesTable)
+          .set({ status: "failed" })
+          .where(eq(scheduledMessagesTable.id, msg.id));
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, "Scheduled messages check failed");
+  }
+}
+
+setInterval(() => { void sendScheduledMessages(); }, 30_000);
+
+// ─── Main chat ───────────────────────────────────────────────────────────────
+
+async function chat(userId: number, userText: string): Promise<string> {
+  const memory = await loadMemory(userId);
+  const sysPrompt = SYSTEM_PROMPT_BASE + memory;
+
+  const history = conversations.get(userId) ?? [];
+  history.push({ role: "user", content: userText });
+
+  const completion = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    messages: [{ role: "system", content: sysPrompt }, ...history],
+    max_tokens: 512,
+  });
+
+  const reply =
+    completion.choices[0]?.message?.content?.trim() ??
+    "извини, что-то пошло не так";
+
+  history.push({ role: "assistant", content: reply });
+  if (history.length > 30) history.splice(0, 2);
+  conversations.set(userId, history);
+
+  void updateMemoryBackground(userId, history);
+
+  return reply;
+}
+
+// ─── Stats ───────────────────────────────────────────────────────────────────
+
 async function getStats(): Promise<string> {
   const now = new Date();
   const today = new Date(now);
@@ -94,6 +353,11 @@ async function getStats(): Promise<string> {
     .select({ count: count() })
     .from(telegramUsersTable)
     .where(gte(telegramUsersTable.firstSeen, today));
+
+  const [pendingFollowUps] = await db
+    .select({ count: count() })
+    .from(scheduledMessagesTable)
+    .where(eq(scheduledMessagesTable.status, "pending"));
 
   const topUsers = await db
     .select({
@@ -121,33 +385,14 @@ async function getStats(): Promise<string> {
     `🟢 Активны за 24ч: <b>${activeDay?.count ?? 0}</b>`,
     `📅 Активны за неделю: <b>${activeWeek?.count ?? 0}</b>`,
     `✨ Новых сегодня: <b>${newToday?.count ?? 0}</b>`,
+    `⏰ Запланировано сообщений: <b>${pendingFollowUps?.count ?? 0}</b>`,
     ``,
     `🏆 <b>Топ-5 по сообщениям:</b>`,
     topList || `пока никого нет`,
   ].join("\n");
 }
 
-async function chat(chatId: number, userText: string): Promise<string> {
-  const history = conversations.get(chatId) ?? [];
-  history.push({ role: "user", content: userText });
-
-  const completion = await groq.chat.completions.create({
-    model: "llama-3.3-70b-versatile",
-    messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
-    max_tokens: 512,
-  });
-
-  const reply =
-    completion.choices[0]?.message?.content?.trim() ??
-    "извини, что-то пошло не так";
-
-  history.push({ role: "assistant", content: reply });
-
-  if (history.length > 20) history.splice(0, 2);
-  conversations.set(chatId, history);
-
-  return reply;
-}
+// ─── Commands ────────────────────────────────────────────────────────────────
 
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
@@ -155,22 +400,49 @@ bot.onText(/\/start/, async (msg) => {
   conversations.delete(chatId);
   if (msg.from) await trackUser(msg.from);
 
-  bot.sendMessage(
+  const memory = await loadMemory(chatId);
+  const isReturning = memory.length > 0;
+
+  if (isReturning) {
+    const sysPrompt = SYSTEM_PROMPT_BASE + memory;
+    const resp = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        { role: "system", content: sysPrompt },
+        {
+          role: "user",
+          content: `[Пользователь вернулся. Напиши тёплое приветствие, вспомни что-то из истории — как старый друг. Коротко, живо, без пафоса.]`,
+        },
+      ],
+      max_tokens: 150,
+    });
+    const greeting = resp.choices[0]?.message?.content?.trim();
+    if (greeting) {
+      await sendWithTyping(chatId, greeting);
+      return;
+    }
+  }
+
+  await sendWithTyping(
     chatId,
     `о, привет ${firstName}) я сэм, мне 20, можем просто поговорить — ни о чём или обо всём сразу\n\nпиши что хочешь, я тут`,
   );
 });
 
 bot.onText(/\/help/, (msg) => {
-  bot.sendMessage(
+  void bot.sendMessage(
     msg.chat.id,
-    `да тут ничего особого\n/start — начать сначала\n/clear — стереть историю\n/stat — статистика\n\nну или просто пиши, я отвечу (это не сложно)`,
+    `да тут ничего особого\n/start — начать сначала\n/clear — стереть историю\n/stat — статистика\n\nну или просто пиши, я отвечу`,
   );
 });
 
-bot.onText(/\/clear/, (msg) => {
-  conversations.delete(msg.chat.id);
-  bot.sendMessage(msg.chat.id, "всё, чистый лист. как будто не было ничего)");
+bot.onText(/\/clear/, async (msg) => {
+  const chatId = msg.chat.id;
+  conversations.delete(chatId);
+  await db
+    .delete(userMemoryTable)
+    .where(eq(userMemoryTable.userId, chatId));
+  void bot.sendMessage(chatId, "всё, чистый лист. как будто не было ничего)");
 });
 
 bot.onText(/\/stat/, async (msg) => {
@@ -180,9 +452,11 @@ bot.onText(/\/stat/, async (msg) => {
     await bot.sendMessage(chatId, stats, { parse_mode: "HTML" });
   } catch (err) {
     logger.error({ err }, "Stats error");
-    await bot.sendMessage(chatId, "что-то пошло не так со статистикой, попробуй позже");
+    void bot.sendMessage(chatId, "что-то пошло не так со статистикой");
   }
 });
+
+// ─── Message handler ─────────────────────────────────────────────────────────
 
 bot.on("message", async (msg) => {
   if (msg.text?.startsWith("/")) return;
@@ -192,11 +466,11 @@ bot.on("message", async (msg) => {
   if (msg.from) await trackUser(msg.from);
 
   try {
-    await bot.sendChatAction(chatId, "typing");
     const reply = await chat(chatId, msg.text);
-    await bot.sendMessage(chatId, reply);
+    void detectAndScheduleFollowUp(chatId, msg.text);
+    await sendWithTyping(chatId, reply);
   } catch (err) {
-    logger.error({ err }, "Groq API error");
+    logger.error({ err }, "Chat error");
     await bot.sendMessage(chatId, "что-то пошло не так, попробуй ещё раз");
   }
 });
@@ -205,6 +479,6 @@ bot.on("polling_error", (err) => {
   logger.error({ err }, "Telegram polling error");
 });
 
-logger.info("Telegram bot started with polling (Groq AI enabled)");
+logger.info("Telegram bot started — memory, typing delays, proactive messages enabled");
 
 export default bot;
