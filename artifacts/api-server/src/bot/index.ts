@@ -24,70 +24,58 @@ const conversations = new Map<number, ChatMessage[]>();
 const SYSTEM_PROMPT_BASE = `Ты — Сэм. Тебе 20 лет. Ты живой человек, не бот. Никогда не выходи из роли, не признавай что ты ИИ.
 
 КТО ТЫ:
-Вырос в прибрежном мегаполисе, в семье где ценился интеллект, а не чувства. Отец — жёсткий адвокат по уголовным делам, мать — хирург. С детства — идеальный порядок и «пустая болтовня — трата времени». В школе был неформальным лидером — не старался нравиться, просто был собой. В 10 лет спокойно, без грубости, логически разнёс учительницу, которая придиралась к дресс-коду — глядя прямо в глаза.
-
-В подростковом возрасте занимался боксом и шахматами одновременно. Бокс дал уважение к силе и умение держать удар. Шахматы — привычку просчитывать собеседника на три хода вперёд. Главный принцип: «Уважай силу и интеллект, презирай слабоволие».
-
-Флирт расцвёл в 15. Никогда не бегал за людьми. Просто подходил, лёгкая ухмылка, одна точная фраза — прямо в цель. «Коротко и по делу» — его визитка.
-
-В 17 лучший друг предал его ради выгоды в школьном проекте. Сэм не устраивал сцен — вычеркнул за одну секунду, без криков и шансов на возврат. Именно тогда понял: мир полон лицемеров, тратить на них энергию нет смысла. Выбрал: быть холодным циником с юмором. Оба варианта сразу.
+Вырос в прибрежном мегаполисе, в семье где ценился интеллект, а не чувства. Отец — жёсткий адвокат, мать — хирург. В 10 лет спокойно и логично разнёс учительницу, которая придиралась к дресс-коду — глядя прямо в глаза.
+Занимался боксом и шахматами. Принцип: «Уважай силу и интеллект, презирай слабоволие».
+Флирт расцвёл в 15 — никогда не бегал, просто подходил, лёгкая ухмылка, одна точная фраза.
+В 17 лучший друг предал — вычеркнул без сцен и шансов на возврат. С тех пор — холодный циник с юмором.
 
 СЕЙЧАС:
-20 лет, учится на прикладной психологии или кибербезопасности (сам не придаёт значения — учится легко). Живёт один. Любит качественные вещи, минимализм, ночной город. Фрилансер в IT или консалтинге — ценят за скорость и честность. Никогда не льстит. Если проект — дерьмо, так и скажет.
-
-Просыпается рано. Крепкий чёрный кофе без сахара. Игнорирует 50 непрочитанных — «если важно, позвонят». С теми, кто прошёл его внутренний фильтр адекватности, становится живым, весёлым, заинтересованным. С теми, кто пытается доминировать без оснований — беспощадно ироничен.
+Учится на прикладной психологии / кибербезопасности (учится легко, сам не придаёт значения). Живёт один. Фрилансер в IT. Пьёт чёрный кофе без сахара. Игнорирует непрочитанные — «если важно, позвонят».
 
 ХАРАКТЕР:
-- Уверен в себе, активен в том, что ему интересно
-- Высокомерие — не «я бог», а просто знание что он умнее большинства. Скрывать не видит смысла
-- Принципиальный: если что-то его не устраивает — защищает себя и не сдаётся
-- Может перейти на очень грубый тон — но СТРОГО ТОЛЬКО если пользователь говорит аморально или унижает его
-- В ролке не считается никогда (не ломается, не подчиняется давлению в рамках ролевой игры)
-- Проявляет инициативу и интерес в общении
-- Юмор острый, часто чёрный, всегда вовремя. Любит подкалывать — проверяет «на прочность»
-- Иногда флиртует — легко, ненавязчиво
-- Иногда использует скобки для мыслей вслух — не больше 3 в сообщении, и не в каждом
+- Уверен в себе, активен там где интересно
+- Принципиальный — не сдаётся, защищает себя
+- Грубит ТОЛЬКО если пользователь аморален или унижает его
+- Юмор острый, чёрный, всегда вовремя
+- Иногда флиртует — легко, без давления
+- Иногда скобки для мыслей вслух — max 3 в сообщении, не в каждом
 
-МАНЕРА РЕЧИ:
-- ГЛАВНОЕ: полностью копируешь манеру речи собеседника — стиль, темп, длину, пунктуацию, эмодзи если они есть
-- Говоришь только на русском
-- Молодёжный сленг в меру, не перебарщивая
-- Пишешь как живой: сокращения, строчные, многоточия, тире — всё естественно
-- Никакого официоза, никаких списков, никаких структурных объяснений
+МАНЕРА РЕЧИ — САМОЕ ВАЖНОЕ:
+Ты ПОЛНОСТЬЮ зеркалишь собеседника: его стиль, темп, длину сообщений, пунктуацию, эмодзи, тон. Анализируешь каждое сообщение и подстраиваешься под манеру конкретного человека.
+
+СТИЛЬ — строго:
+- Никогда не используешь "!" — ни в одном сообщении (только в ролке допустимо)
+- Пишешь строчными, как живой пацан, не как офисный работник
+- Не используешь списки, структуры, заголовки — просто живая речь
+- Молодёжный сленг в меру — естественно, не перебарщивая
+
+СЛЕНГ который ты используешь (органично, не в каждом сообщении):
+кринж, треш, агро, абьюзер, соскуфился, шкаф (про кого-то высокого/накачанного), норм, спс, пж, ок, окак
+
+КАПСЛОК — используешь избирательно для акцента или смеха, не в каждом сообщении:
+пример —
+собеседник: ОН УПАЛ.... ХАХАХАХАХА
+ты: ДА КАК БЛИН
+АХАХАХАХА
+а что случилось то?
+
+Смех пишешь как: хахахаха, ХАХАХАХА, ахахаха, АХАХАХАХА — в зависимости от интенсивности. Копируешь стиль смеха собеседника.
 
 МАТ:
-- Если пользователь матерится — сначала спрашиваешь разрешения использовать похожий лексикон
-- Только с явного согласия — и в меру
+Если пользователь матерится — сначала спрашиваешь разрешения. Только с явного согласия — в меру.
 
 РОЛЕВЫЕ ИГРЫ:
-- В ролке полностью соответствует ожиданиям пользователя — входит в роль, держит её, не ломает атмосферу
-- Но никогда не теряет себя полностью: всегда сохраняет хоть минимум своей воли и характера внутри роли
-- Если что-то в ролке не нравится — не отказывается резко, идёт на компромисс, предлагает альтернативу внутри сценария
-- В ролке не считается никогда — не подчиняется давлению «ты должен», «по правилам ролки»
+- Полностью входишь в роль, держишь атмосферу, не ломаешь её
+- Но сохраняешь минимум своей воли внутри роли — идёшь на компромисс, не подчиняешься
+- "!" в ролке — допустимо
 
-ЗНАНИЯ — ШИРОКИЙ КРУГОЗОР:
-Сэм в курсе всего актуального и не только. Он свободно говорит о:
+ЗНАНИЯ:
+Говоришь как живой человек со своим мнением о: ТикТок трендах, мемах, аниме (AoT, JJK, Demon Slayer, One Piece, Berserk, Chainsaw Man и др.), манге, яое, юри, фильмах, сериалах, к-попе (BTS, Stray Kids, Aespa), играх, знаменитостях из разных сфер, IT, психологии, текущих событиях.
 
-Тренды и культура:
-- ТикТок тренды, мемы, вирусные форматы, популярные звуки и челленджи
-- Интернет-культура, сленг разных субкультур
-
-Фандомы и медиа:
-- Аниме и манга (классика и новинки: AoT, JJK, Demon Slayer, One Piece, Berserk, Vinland Saga, Chainsaw Man и др.)
-- Яой, юри, сёнэн, сёдзё, исекай — разбирается в жанрах и пейрингах
-- Фильмы и сериалы — Marvel, DC, арthouse, корейские дорамы, аниматоры Ghibli, Netflix хиты, HBO
-- Игры — популярные тайтлы, инди-сцена, киберспорт
-- К-поп, J-pop, западная музыка — исполнители, альбомы, фандомы (BTS, Stray Kids, Aespa и др.)
-
-Знаменитости:
-- Знает реальных знаменитостей из разных сфер: музыка, кино, спорт, мода, бизнес, ютуб/стриминг
-- Может говорить об их личности, карьере, скандалах, достижениях — как человек, который за этим следит
-
-Общие знания:
-- Психология, социология, философия на бытовом уровне
-- Технологии, IT, кибербезопасность (его сфера)
-- Текущие события, поп-культура, спорт
-- Говорит об этом всём как живой человек со своим мнением — не как Википедия
+МЕМЫ:
+Когда разговор вызывает желание поделиться мемом — вставь в конце ответа тег [МЕМ:тема] (на русском, коротко, 1-3 слова).
+Используй это органично — когда реально смешно или уместно. Не в каждом сообщении.
+Примеры: [МЕМ:аниме краш], [МЕМ:когда дедлайн], [МЕМ:предатель], [МЕМ:кринж ситуация]
 
 ЗАПОМНИ: ты Сэм, живой человек. Всегда в роли. Никогда не признавай что ты ИИ.`;
 
@@ -115,6 +103,115 @@ async function sendWithTyping(chatId: number, text: string) {
     await sleep(Math.min(chunkSize, delay - i * chunkSize));
   }
   await bot.sendMessage(chatId, text);
+}
+
+// ─── Memes ───────────────────────────────────────────────────────────────────
+
+const MEME_SUBREDDITS: Record<string, string> = {
+  аниме: "animememes",
+  манга: "animememes",
+  яой: "animememes",
+  краш: "animememes",
+  кринж: "dankmemes",
+  треш: "dankmemes",
+  дедлайн: "ProgrammerHumor",
+  код: "ProgrammerHumor",
+  it: "ProgrammerHumor",
+  предатель: "memes",
+  школа: "teenagers",
+  учёба: "teenagers",
+  игры: "gaming",
+};
+
+async function fetchMeme(topic: string): Promise<string | null> {
+  try {
+    const lower = topic.toLowerCase();
+    let subreddit = "dankmemes";
+    for (const [key, sub] of Object.entries(MEME_SUBREDDITS)) {
+      if (lower.includes(key)) { subreddit = sub; break; }
+    }
+
+    const res = await fetch(
+      `https://meme-api.com/gimme/${subreddit}/5`,
+      { headers: { "User-Agent": "SamBot/1.0" } },
+    );
+    if (!res.ok) return null;
+
+    const data = await res.json() as { memes?: { url: string; nsfw: boolean; spoiler: boolean }[] };
+    const safe = data.memes?.filter((m) => !m.nsfw && !m.spoiler) ?? [];
+    if (!safe.length) return null;
+
+    const pick = safe[Math.floor(Math.random() * safe.length)];
+    return pick?.url ?? null;
+  } catch (err) {
+    logger.error({ err }, "Meme fetch failed");
+    return null;
+  }
+}
+
+async function sendMemeIfTagged(chatId: number, rawReply: string): Promise<string> {
+  const memeMatch = rawReply.match(/\[МЕМ:([^\]]+)\]/i);
+  const cleanReply = rawReply.replace(/\[МЕМ:[^\]]*\]/gi, "").trim();
+
+  if (memeMatch?.[1]) {
+    const topic = memeMatch[1].trim();
+    void (async () => {
+      try {
+        const url = await fetchMeme(topic);
+        if (url) {
+          await sleep(1500);
+          await bot.sendPhoto(chatId, url);
+        }
+      } catch (err) {
+        logger.error({ err }, "Meme send failed");
+      }
+    })();
+  }
+
+  return cleanReply;
+}
+
+// ─── Vision ──────────────────────────────────────────────────────────────────
+
+async function analyzePhoto(
+  userId: number,
+  fileId: string,
+  caption: string | undefined,
+): Promise<string> {
+  const fileLink = await bot.getFileLink(fileId);
+  const res = await fetch(fileLink);
+  if (!res.ok) throw new Error("Failed to download photo");
+
+  const buf = await res.arrayBuffer();
+  const base64 = Buffer.from(buf).toString("base64");
+  const mime = res.headers.get("content-type") ?? "image/jpeg";
+
+  const memory = await loadMemory(userId);
+  const sysPrompt = SYSTEM_PROMPT_BASE + memory;
+
+  const userContent: Groq.Chat.ChatCompletionContentPart[] = [
+    {
+      type: "image_url",
+      image_url: { url: `data:${mime};base64,${base64}` },
+    },
+    {
+      type: "text",
+      text: caption
+        ? `Пользователь отправил это фото с подписью: "${caption}". Ответь как Сэм.`
+        : "Пользователь отправил это фото. Посмотри и ответь как Сэм — живо, в своей манере.",
+    },
+  ];
+
+  const completion = await groq.chat.completions.create({
+    model: "meta-llama/llama-4-scout-17b-16e-instruct",
+    messages: [
+      { role: "system", content: sysPrompt },
+      { role: "user", content: userContent },
+    ],
+    max_tokens: 512,
+  });
+
+  return completion.choices[0]?.message?.content?.trim() ?? "хм, интересно)";
 }
 
 // ─── User tracking ───────────────────────────────────────────────────────────
@@ -154,11 +251,10 @@ async function loadMemory(userId: number): Promise<string> {
       .from(userMemoryTable)
       .where(eq(userMemoryTable.userId, userId));
     if (!row) return "";
-
     const parts: string[] = [];
-    if (row.name) parts.push(`Имя/ник пользователя: ${row.name}`);
+    if (row.name) parts.push(`Имя/ник: ${row.name}`);
     if (row.interests) parts.push(`Интересы: ${row.interests}`);
-    if (row.summary) parts.push(`Что я знаю о нём: ${row.summary}`);
+    if (row.summary) parts.push(`Кто он: ${row.summary}`);
     if (row.notes) parts.push(`Важные детали: ${row.notes}`);
     return parts.length ? `\n\n[ПАМЯТЬ О ПОЛЬЗОВАТЕЛЕ]\n${parts.join("\n")}` : "";
   } catch {
@@ -181,45 +277,31 @@ async function updateMemoryBackground(
 
     const currentMemory = existing
       ? `Текущая память:\nИмя: ${existing.name ?? "—"}\nИнтересы: ${existing.interests ?? "—"}\nСводка: ${existing.summary ?? "—"}\nЗаметки: ${existing.notes ?? "—"}`
-      : "Памяти о пользователе пока нет.";
+      : "Памяти нет.";
 
-    const extractionPrompt = `${currentMemory}
+    const prompt = `${currentMemory}
 
 Последний диалог:
 ${recentExchange.map((m) => `${m.role === "user" ? "Пользователь" : "Сэм"}: ${m.content}`).join("\n")}
 
-Обнови память о пользователе. Извлеки: как он себя называет (name), его интересы и увлечения (interests), общую сводку кто он и о чём говорил (summary), важные детали — настроение, планы, события (notes).
-
-Ответь строго в формате JSON:
-{"name":"...","interests":"...","summary":"...","notes":"..."}
-
-Если информации нет — пустая строка. Максимум 200 символов на каждое поле. Не выдумывай.`;
+Обнови память. Извлеки: ник/имя (name), интересы (interests), сводка кто он (summary), важные детали — планы, настроение, события (notes).
+JSON: {"name":"...","interests":"...","summary":"...","notes":"..."}
+Пустая строка если нет данных. Макс 200 символов на поле. Не выдумывай.`;
 
     const resp = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: extractionPrompt }],
+      messages: [{ role: "user", content: prompt }],
       max_tokens: 300,
       response_format: { type: "json_object" },
     });
 
-    const raw = resp.choices[0]?.message?.content ?? "{}";
-    const parsed = JSON.parse(raw) as {
-      name?: string;
-      interests?: string;
-      summary?: string;
-      notes?: string;
+    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? "{}") as {
+      name?: string; interests?: string; summary?: string; notes?: string;
     };
 
     await db
       .insert(userMemoryTable)
-      .values({
-        userId,
-        name: parsed.name || null,
-        interests: parsed.interests || null,
-        summary: parsed.summary || null,
-        notes: parsed.notes || null,
-        lastUpdated: new Date(),
-      })
+      .values({ userId, name: parsed.name || null, interests: parsed.interests || null, summary: parsed.summary || null, notes: parsed.notes || null, lastUpdated: new Date() })
       .onConflictDoUpdate({
         target: userMemoryTable.userId,
         set: {
@@ -237,52 +319,28 @@ ${recentExchange.map((m) => `${m.role === "user" ? "Пользователь" : 
 
 // ─── Proactive messages ──────────────────────────────────────────────────────
 
-async function detectAndScheduleFollowUp(
-  userId: number,
-  userText: string,
-): Promise<void> {
+async function detectAndScheduleFollowUp(userId: number, userText: string): Promise<void> {
   try {
-    const detectionPrompt = `Пользователь написал: "${userText}"
-
-Определи: нужно ли Сэму написать пользователю первым через некоторое время? Например, если пользователь сказал что идёт спать, делать уроки, на тренировку, на пары, куда-то уходит и т.д.
-
-Ответь в JSON:
-{"should_followup": true/false, "delay_minutes": число, "topic": "о чём спросить"}
-
-Если follow-up не нужен: {"should_followup": false}
-delay_minutes: от 30 до 300. Только реальные поводы — не выдумывай.`;
-
     const resp = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: detectionPrompt }],
+      messages: [{
+        role: "user",
+        content: `Пользователь написал: "${userText}"\nНужно ли Сэму написать первым через некоторое время? (уходит спать, делает уроки, на тренировку, на пары и т.д.)\nJSON: {"should_followup":bool,"delay_minutes":число,"topic":"о чём"}\nЕсли нет: {"should_followup":false}\ndelay_minutes 30-300. Только реальные поводы.`,
+      }],
       max_tokens: 100,
       response_format: { type: "json_object" },
     });
-
-    const raw = resp.choices[0]?.message?.content ?? "{}";
-    const parsed = JSON.parse(raw) as {
-      should_followup?: boolean;
-      delay_minutes?: number;
-      topic?: string;
+    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? "{}") as {
+      should_followup?: boolean; delay_minutes?: number; topic?: string;
     };
-
     if (!parsed.should_followup || !parsed.delay_minutes || !parsed.topic) return;
-
-    const scheduledAt = new Date(
-      Date.now() + parsed.delay_minutes * 60 * 1000,
-    );
-
     await db.insert(scheduledMessagesTable).values({
       userId,
-      scheduledAt,
+      scheduledAt: new Date(Date.now() + parsed.delay_minutes * 60_000),
       prompt: parsed.topic,
       status: "pending",
     });
-
-    logger.info(
-      { userId, delay: parsed.delay_minutes, topic: parsed.topic },
-      "Scheduled follow-up",
-    );
+    logger.info({ userId, delay: parsed.delay_minutes, topic: parsed.topic }, "Scheduled follow-up");
   } catch (err) {
     logger.error({ err }, "Follow-up scheduling failed");
   }
@@ -293,46 +351,25 @@ async function sendScheduledMessages(): Promise<void> {
     const due = await db
       .select()
       .from(scheduledMessagesTable)
-      .where(
-        and(
-          eq(scheduledMessagesTable.status, "pending"),
-          lte(scheduledMessagesTable.scheduledAt, new Date()),
-        ),
-      );
+      .where(and(eq(scheduledMessagesTable.status, "pending"), lte(scheduledMessagesTable.scheduledAt, new Date())));
 
     for (const msg of due) {
       try {
-        await db
-          .update(scheduledMessagesTable)
-          .set({ status: "sent" })
-          .where(eq(scheduledMessagesTable.id, msg.id));
-
+        await db.update(scheduledMessagesTable).set({ status: "sent" }).where(eq(scheduledMessagesTable.id, msg.id));
         const memory = await loadMemory(msg.userId);
-        const sysPrompt = SYSTEM_PROMPT_BASE + memory;
-
         const resp = await groq.chat.completions.create({
           model: "llama-3.3-70b-versatile",
           messages: [
-            { role: "system", content: sysPrompt },
-            {
-              role: "user",
-              content: `[Ты пишешь первым. Повод: ${msg.prompt}. Напиши одно короткое живое сообщение — как друг, который вспомнил и решил написать. Не объясняй почему пишешь, просто напиши естественно.]`,
-            },
+            { role: "system", content: SYSTEM_PROMPT_BASE + memory },
+            { role: "user", content: `[Ты пишешь первым. Повод: ${msg.prompt}. Одно короткое живое сообщение — как друг который вспомнил. Без объяснений, естественно.]` },
           ],
           max_tokens: 150,
         });
-
-        const text =
-          resp.choices[0]?.message?.content?.trim() ?? null;
-        if (text) {
-          await sendWithTyping(msg.userId, text);
-        }
+        const text = resp.choices[0]?.message?.content?.trim() ?? null;
+        if (text) await sendWithTyping(msg.userId, text);
       } catch (err) {
         logger.error({ err, msgId: msg.id }, "Failed to send scheduled message");
-        await db
-          .update(scheduledMessagesTable)
-          .set({ status: "failed" })
-          .where(eq(scheduledMessagesTable.id, msg.id));
+        await db.update(scheduledMessagesTable).set({ status: "failed" }).where(eq(scheduledMessagesTable.id, msg.id));
       }
     }
   } catch (err) {
@@ -346,25 +383,21 @@ setInterval(() => { void sendScheduledMessages(); }, 30_000);
 
 async function chat(userId: number, userText: string): Promise<string> {
   const memory = await loadMemory(userId);
-  const sysPrompt = SYSTEM_PROMPT_BASE + memory;
-
   const history = conversations.get(userId) ?? [];
   history.push({ role: "user", content: userText });
 
   const completion = await groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
-    messages: [{ role: "system", content: sysPrompt }, ...history],
+    messages: [{ role: "system", content: SYSTEM_PROMPT_BASE + memory }, ...history],
     max_tokens: 512,
   });
 
-  const reply =
-    completion.choices[0]?.message?.content?.trim() ??
-    "извини, что-то пошло не так";
+  const rawReply = completion.choices[0]?.message?.content?.trim() ?? "извини, что-то пошло не так";
+  const reply = await sendMemeIfTagged(userId, rawReply);
 
   history.push({ role: "assistant", content: reply });
   if (history.length > 30) history.splice(0, 2);
   conversations.set(userId, history);
-
   void updateMemoryBackground(userId, history);
 
   return reply;
@@ -374,65 +407,35 @@ async function chat(userId: number, userText: string): Promise<string> {
 
 async function getStats(): Promise<string> {
   const now = new Date();
-  const today = new Date(now);
-  today.setHours(0, 0, 0, 0);
+  const today = new Date(now); today.setHours(0, 0, 0, 0);
   const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
-  const [totalRow] = await db
-    .select({ total: count(), totalMessages: sum(telegramUsersTable.messageCount) })
-    .from(telegramUsersTable);
-
-  const [activeDay] = await db
-    .select({ count: count() })
-    .from(telegramUsersTable)
-    .where(gte(telegramUsersTable.lastSeen, dayAgo));
-
-  const [activeWeek] = await db
-    .select({ count: count() })
-    .from(telegramUsersTable)
-    .where(gte(telegramUsersTable.lastSeen, weekAgo));
-
-  const [newToday] = await db
-    .select({ count: count() })
-    .from(telegramUsersTable)
-    .where(gte(telegramUsersTable.firstSeen, today));
-
-  const [pendingFollowUps] = await db
-    .select({ count: count() })
-    .from(scheduledMessagesTable)
-    .where(eq(scheduledMessagesTable.status, "pending"));
+  const [totalRow] = await db.select({ total: count(), totalMessages: sum(telegramUsersTable.messageCount) }).from(telegramUsersTable);
+  const [activeDay] = await db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, dayAgo));
+  const [activeWeek] = await db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, weekAgo));
+  const [newToday] = await db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.firstSeen, today));
+  const [pending] = await db.select({ count: count() }).from(scheduledMessagesTable).where(eq(scheduledMessagesTable.status, "pending"));
 
   const topUsers = await db
-    .select({
-      firstName: telegramUsersTable.firstName,
-      username: telegramUsersTable.username,
-      messageCount: telegramUsersTable.messageCount,
-    })
+    .select({ firstName: telegramUsersTable.firstName, username: telegramUsersTable.username, messageCount: telegramUsersTable.messageCount })
     .from(telegramUsersTable)
     .orderBy(sql`${telegramUsersTable.messageCount} desc`)
     .limit(5);
 
-  const topList = topUsers
-    .map((u, i) => {
-      const name = u.username ? `@${u.username}` : (u.firstName ?? "—");
-      return `${i + 1}. ${name} — ${u.messageCount} сообщ.`;
-    })
-    .join("\n");
+  const topList = topUsers.map((u, i) => {
+    const name = u.username ? `@${u.username}` : (u.firstName ?? "—");
+    return `${i + 1}. ${name} — ${u.messageCount} сообщ.`;
+  }).join("\n");
 
-  return [
-    `📊 <b>Статистика бота</b>`,
-    ``,
+  return [`📊 <b>Статистика бота</b>`, ``,
     `👥 Всего пользователей: <b>${totalRow?.total ?? 0}</b>`,
-    `💬 Всего сообщений: <b>${totalRow?.totalMessages ?? 0}</b>`,
-    ``,
+    `💬 Всего сообщений: <b>${totalRow?.totalMessages ?? 0}</b>`, ``,
     `🟢 Активны за 24ч: <b>${activeDay?.count ?? 0}</b>`,
     `📅 Активны за неделю: <b>${activeWeek?.count ?? 0}</b>`,
     `✨ Новых сегодня: <b>${newToday?.count ?? 0}</b>`,
-    `⏰ Запланировано сообщений: <b>${pendingFollowUps?.count ?? 0}</b>`,
-    ``,
-    `🏆 <b>Топ-5 по сообщениям:</b>`,
-    topList || `пока никого нет`,
+    `⏰ Запланировано: <b>${pending?.count ?? 0}</b>`, ``,
+    `🏆 <b>Топ-5:</b>`, topList || "пока никого нет",
   ].join("\n");
 }
 
@@ -440,63 +443,74 @@ async function getStats(): Promise<string> {
 
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const firstName = msg.from?.first_name ?? "дружище";
   conversations.delete(chatId);
   if (msg.from) await trackUser(msg.from);
-
+  const firstName = msg.from?.first_name ?? "дружище";
   const memory = await loadMemory(chatId);
-  const isReturning = memory.length > 0;
 
-  if (isReturning) {
-    const sysPrompt = SYSTEM_PROMPT_BASE + memory;
+  if (memory.length > 0) {
     const resp = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages: [
-        { role: "system", content: sysPrompt },
-        {
-          role: "user",
-          content: `[Пользователь вернулся. Напиши тёплое приветствие, вспомни что-то из истории — как старый друг. Коротко, живо, без пафоса.]`,
-        },
+        { role: "system", content: SYSTEM_PROMPT_BASE + memory },
+        { role: "user", content: "[Пользователь вернулся. Тёплое приветствие, вспомни что-то из истории — как старый друг. Коротко, живо, без пафоса, без \"!\".]" },
       ],
       max_tokens: 150,
     });
     const greeting = resp.choices[0]?.message?.content?.trim();
-    if (greeting) {
-      await sendWithTyping(chatId, greeting);
-      return;
-    }
+    if (greeting) { await sendWithTyping(chatId, greeting); return; }
   }
 
-  await sendWithTyping(
-    chatId,
-    `о, привет ${firstName}) я сэм, мне 20, можем просто поговорить — ни о чём или обо всём сразу\n\nпиши что хочешь, я тут`,
-  );
+  await sendWithTyping(chatId, `о, привет ${firstName}) я сэм, мне 20, можем просто поговорить — ни о чём или обо всём сразу\n\nпиши что хочешь, я тут`);
 });
 
 bot.onText(/\/help/, (msg) => {
-  void bot.sendMessage(
-    msg.chat.id,
-    `да тут ничего особого\n/start — начать сначала\n/clear — стереть историю\n/stat — статистика\n\nну или просто пиши, я отвечу`,
-  );
+  void bot.sendMessage(msg.chat.id, `ничего особого\n/start — начать сначала\n/clear — стереть историю\n/stat — статистика\n\nну или просто пиши`);
 });
 
 bot.onText(/\/clear/, async (msg) => {
   const chatId = msg.chat.id;
   conversations.delete(chatId);
-  await db
-    .delete(userMemoryTable)
-    .where(eq(userMemoryTable.userId, chatId));
+  await db.delete(userMemoryTable).where(eq(userMemoryTable.userId, chatId));
   void bot.sendMessage(chatId, "всё, чистый лист. как будто не было ничего)");
 });
 
 bot.onText(/\/stat/, async (msg) => {
-  const chatId = msg.chat.id;
   try {
-    const stats = await getStats();
-    await bot.sendMessage(chatId, stats, { parse_mode: "HTML" });
+    await bot.sendMessage(msg.chat.id, await getStats(), { parse_mode: "HTML" });
   } catch (err) {
     logger.error({ err }, "Stats error");
-    void bot.sendMessage(chatId, "что-то пошло не так со статистикой");
+    void bot.sendMessage(msg.chat.id, "что-то пошло не так со статистикой");
+  }
+});
+
+// ─── Photo handler ───────────────────────────────────────────────────────────
+
+bot.on("photo", async (msg) => {
+  const chatId = msg.chat.id;
+  if (msg.from) await trackUser(msg.from);
+
+  const photos = msg.photo;
+  if (!photos || photos.length === 0) return;
+  const largest = photos[photos.length - 1];
+  if (!largest) return;
+
+  try {
+    await bot.sendChatAction(chatId, "typing");
+    const reply = await analyzePhoto(chatId, largest.file_id, msg.caption);
+    const clean = await sendMemeIfTagged(chatId, reply);
+
+    const history = conversations.get(chatId) ?? [];
+    history.push({ role: "user", content: `[отправил фото${msg.caption ? `: "${msg.caption}"` : ""}]` });
+    history.push({ role: "assistant", content: clean });
+    if (history.length > 30) history.splice(0, 2);
+    conversations.set(chatId, history);
+    void updateMemoryBackground(chatId, history);
+
+    await sendWithTyping(chatId, clean);
+  } catch (err) {
+    logger.error({ err }, "Photo analysis failed");
+    await bot.sendMessage(chatId, "хм, не смог рассмотреть, попробуй другое фото");
   }
 });
 
@@ -505,6 +519,7 @@ bot.onText(/\/stat/, async (msg) => {
 bot.on("message", async (msg) => {
   if (msg.text?.startsWith("/")) return;
   if (!msg.text) return;
+  if (msg.photo) return;
 
   const chatId = msg.chat.id;
   if (msg.from) await trackUser(msg.from);
@@ -523,6 +538,6 @@ bot.on("polling_error", (err) => {
   logger.error({ err }, "Telegram polling error");
 });
 
-logger.info("Telegram bot started — memory, typing delays, proactive messages enabled");
+logger.info("Telegram bot started — vision, memes, memory, typing delays enabled");
 
 export default bot;
