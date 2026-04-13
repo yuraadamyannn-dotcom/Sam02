@@ -5,6 +5,7 @@ import { promisify } from "util";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { storePayload, getPayload, hasPrefix } from "./callback_store";
 
 const execFileAsync = promisify(execFile);
 
@@ -16,58 +17,79 @@ export interface TrackInfo {
   author: string;
   durationSec: number;
   url: string;
+  thumbnailUrl?: string;
 }
 
-// ─── yt-dlp binary ───────────────────────────────────────────────────────────
+// ─── Binary discovery ─────────────────────────────────────────────────────────
 
-// Absolute path to yt-dlp as installed by Nix — avoids PATH lookup issues
-// inside the Node.js child process. Falls back to "yt-dlp" if not found.
-const YT_DLP_BIN = (() => {
-  const nixPath = "/nix/var/nix/profiles/default/bin/yt-dlp";
-  const nixRunPath = "/run/current-system/sw/bin/yt-dlp";
-  for (const p of [nixPath, nixRunPath]) {
-    try { if (fs.existsSync(p)) return p; } catch { /* */ }
-  }
-  // Scan nix store for yt-dlp binary
+function findBin(name: string): string {
+  // 1. Check nix store directly
   try {
     const store = "/nix/store";
     const entries = fs.readdirSync(store);
     for (const e of entries) {
-      if (e.includes("yt-dlp")) {
-        const bin = path.join(store, e, "bin", "yt-dlp");
-        if (fs.existsSync(bin)) return bin;
+      if (e.toLowerCase().includes(name.toLowerCase().replace("-", ""))) {
+        const bin = path.join(store, e, "bin", name);
+        try { if (fs.existsSync(bin)) return bin; } catch { /* */ }
       }
     }
   } catch { /* */ }
-  return "yt-dlp";
+  // 2. Common system paths
+  for (const p of [`/run/current-system/sw/bin/${name}`, `/usr/bin/${name}`]) {
+    try { if (fs.existsSync(p)) return p; } catch { /* */ }
+  }
+  // 3. Fallback — rely on PATH
+  return name;
+}
+
+const YT_DLP_BIN = findBin("yt-dlp");
+const FFMPEG_BIN = (() => {
+  // ffmpeg from replit-runtime-path or nix
+  const replitPath = "/nix/store/s41bqqrym7dlk8m3nk74fx26kgrx0kv8-replit-runtime-path/bin/ffmpeg";
+  if (fs.existsSync(replitPath)) return replitPath;
+  return findBin("ffmpeg");
 })();
+
+logger.info({ YT_DLP_BIN, FFMPEG_BIN }, "Music: binary paths resolved");
 
 // ─── Search via yt-dlp ────────────────────────────────────────────────────────
 
 export async function searchYouTube(query: string): Promise<TrackInfo | null> {
   try {
+    // Use --dump-json for reliable structured output
     const { stdout } = await execFileAsync(
       YT_DLP_BIN,
       [
         `ytsearch1:${query}`,
-        "--print", "%(id)s\n%(title)s\n%(uploader)s\n%(duration)s",
+        "--dump-json",
         "--no-playlist",
-        "--default-search", "ytsearch",
         "--no-warnings",
         "--quiet",
       ],
-      { timeout: 20_000 }
+      { timeout: 20_000, env: { ...process.env, PATH: process.env.PATH ?? "" } }
     );
-    const lines = stdout.trim().split("\n");
-    if (lines.length < 2) return null;
-    const [videoId, title, author, durationStr] = lines;
-    if (!videoId || videoId.length < 5) return null;
+
+    const line = stdout.trim().split("\n")[0];
+    if (!line) return null;
+
+    const info = JSON.parse(line) as {
+      id?: string;
+      title?: string;
+      uploader?: string;
+      channel?: string;
+      duration?: number;
+      thumbnail?: string;
+    };
+
+    if (!info.id) return null;
+
     return {
-      videoId: videoId.trim(),
-      title: (title ?? query).trim(),
-      author: (author ?? "Неизвестный исполнитель").trim(),
-      durationSec: parseInt(durationStr ?? "0", 10) || 0,
-      url: `https://youtu.be/${videoId.trim()}`,
+      videoId: info.id,
+      title: info.title ?? query,
+      author: info.uploader ?? info.channel ?? "Неизвестный исполнитель",
+      durationSec: info.duration ?? 0,
+      url: `https://youtu.be/${info.id}`,
+      thumbnailUrl: info.thumbnail,
     };
   } catch (err) {
     logger.warn({ err, query }, "yt-dlp search failed");
@@ -75,119 +97,111 @@ export async function searchYouTube(query: string): Promise<TrackInfo | null> {
   }
 }
 
-// ─── Download audio via yt-dlp ────────────────────────────────────────────────
+// ─── Download audio via yt-dlp + ffmpeg ───────────────────────────────────────
 
 async function downloadAudio(videoId: string): Promise<string | null> {
   const tmpDir = os.tmpdir();
-  const outTemplate = path.join(tmpDir, `sam_music_${Date.now()}_%(id)s.%(ext)s`);
+  const stamp = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const outTemplate = path.join(tmpDir, `sam_${stamp}.%(ext)s`);
+
+  const args = [
+    `https://youtu.be/${videoId}`,
+    "-x",
+    "--audio-format", "mp3",
+    "--audio-quality", "5",          // ~128 kbps — быстро и достаточно
+    "--postprocessor-args", `ffmpeg:-ar 44100`,
+    "-o", outTemplate,
+    "--no-playlist",
+    "--no-warnings",
+    "--quiet",
+    "--socket-timeout", "30",
+    "--retries", "3",
+    "--ffmpeg-location", path.dirname(FFMPEG_BIN),
+  ];
 
   try {
-    await execFileAsync(
-      YT_DLP_BIN,
-      [
-        `https://youtu.be/${videoId}`,
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "5",           // 0=best, 9=worst — 5 is ~128kbps, fast
-        "-o", outTemplate,
-        "--no-playlist",
-        "--no-warnings",
-        "--quiet",
-        "--socket-timeout", "30",
-        "--retries", "3",
-      ],
-      { timeout: 120_000 }
-    );
+    await execFileAsync(YT_DLP_BIN, args, {
+      timeout: 180_000,
+      env: { ...process.env, PATH: process.env.PATH ?? "" },
+    });
 
-    // Find the downloaded file
-    const expectedFile = outTemplate
-      .replace("%(id)s", videoId)
-      .replace("%(ext)s", "mp3");
-
+    const expectedFile = path.join(tmpDir, `sam_${stamp}.mp3`);
     if (fs.existsSync(expectedFile)) return expectedFile;
 
-    // Fallback: scan tmpDir for the file (yt-dlp may rename slightly)
-    const files = fs.readdirSync(tmpDir)
-      .filter(f => f.startsWith("sam_music_") && f.endsWith(".mp3"))
+    // Fallback scan — yt-dlp sometimes uses a slightly different name
+    const allFiles = fs.readdirSync(tmpDir)
+      .filter(f => f.startsWith(`sam_${stamp}`) && f.endsWith(".mp3"))
       .map(f => path.join(tmpDir, f));
-    files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-    return files[0] ?? null;
+    allFiles.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+    return allFiles[0] ?? null;
   } catch (err) {
     logger.warn({ err, videoId }, "yt-dlp download failed");
     return null;
   }
 }
 
-// ─── Lyrics API ──────────────────────────────────────────────────────────────
+// ─── Lyrics — 4 источника ────────────────────────────────────────────────────
 
 export async function fetchLyrics(query: string): Promise<string | null> {
-  // Try to split query into artist + title if it looks like "Title Artist"
-  const parts = query.split(/\s{2,}|\s*[-–—]\s*/);
-  const title = parts[0]?.trim() ?? query;
-  const artist = parts[1]?.trim() ?? "";
+  // Normalize query: "Title Artist" or "Title - Artist"
+  const parts = query.trim().split(/\s*[-–—]\s+|\s{2,}/);
+  const titlePart = parts[0]?.trim() ?? query;
+  const artistPart = parts[1]?.trim() ?? "";
 
-  // 1. lyrics.ovh — free, no key required
-  if (artist) {
+  // 1. lrclib.net — самый надёжный, нет лимитов
+  try {
+    const url = `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(7000) });
+    if (res.ok) {
+      const data = await res.json() as Array<{ plainLyrics?: string; syncedLyrics?: string }>;
+      const first = Array.isArray(data) ? data[0] : null;
+      const lyrics = first?.plainLyrics ?? first?.syncedLyrics?.replace(/^\[\d+:\d+\.\d+\] /gm, "");
+      if (lyrics && lyrics.length > 30) return lyrics.slice(0, 3800);
+    }
+  } catch { /* fallthrough */ }
+
+  // 2. api.lyrics.ovh с artist + title
+  if (artistPart) {
     try {
       const res = await fetch(
-        `https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(title)}`,
-        { signal: AbortSignal.timeout(8000) }
+        `https://api.lyrics.ovh/v1/${encodeURIComponent(artistPart)}/${encodeURIComponent(titlePart)}`,
+        { signal: AbortSignal.timeout(7000) }
       );
       if (res.ok) {
         const data = await res.json() as { lyrics?: string };
-        if (data.lyrics && data.lyrics.length > 20) {
-          return data.lyrics.slice(0, 3800);
-        }
+        if (data.lyrics && data.lyrics.length > 30) return data.lyrics.slice(0, 3800);
       }
     } catch { /* fallthrough */ }
   }
 
-  // 2. lyrics.ovh with full query as title, empty artist
+  // 3. api.lyrics.ovh с query как artist и title
   try {
     const res = await fetch(
-      `https://api.lyrics.ovh/v1/${encodeURIComponent(query)}/${encodeURIComponent(title)}`,
-      { signal: AbortSignal.timeout(8000) }
+      `https://api.lyrics.ovh/v1/${encodeURIComponent(query)}/${encodeURIComponent(titlePart)}`,
+      { signal: AbortSignal.timeout(7000) }
     );
     if (res.ok) {
       const data = await res.json() as { lyrics?: string };
-      if (data.lyrics && data.lyrics.length > 20) {
-        return data.lyrics.slice(0, 3800);
-      }
+      if (data.lyrics && data.lyrics.length > 30) return data.lyrics.slice(0, 3800);
     }
   } catch { /* fallthrough */ }
 
-  // 3. some-random-api fallback
+  // 4. some-random-api
   try {
     const res = await fetch(
       `https://some-random-api.com/lyrics?title=${encodeURIComponent(query)}`,
-      { headers: { "User-Agent": "SamBot/1.0" }, signal: AbortSignal.timeout(8000) }
+      { headers: { "User-Agent": "SamBot/1.0" }, signal: AbortSignal.timeout(7000) }
     );
     if (res.ok) {
       const data = await res.json() as { lyrics?: string; error?: string };
-      if (!data.error && data.lyrics && data.lyrics.length > 20) {
-        return data.lyrics.slice(0, 3800);
-      }
-    }
-  } catch { /* fallthrough */ }
-
-  // 4. lrclib — free, no key
-  try {
-    const res = await fetch(
-      `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
-      { signal: AbortSignal.timeout(8000) }
-    );
-    if (res.ok) {
-      const data = await res.json() as Array<{ plainLyrics?: string; syncedLyrics?: string }>;
-      const first = Array.isArray(data) ? data[0] : null;
-      const lyrics = first?.plainLyrics ?? first?.syncedLyrics;
-      if (lyrics && lyrics.length > 20) return lyrics.slice(0, 3800);
+      if (!data.error && data.lyrics && data.lyrics.length > 30) return data.lyrics.slice(0, 3800);
     }
   } catch { /* fallthrough */ }
 
   return null;
 }
 
-// ─── Format helpers ───────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function formatDuration(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -195,9 +209,26 @@ function formatDuration(sec: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-function cleanUp(file: string) {
+function cleanUp(file: string): void {
   try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch { /* ignore */ }
 }
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ─── Telegram callback_data for lyrics (≤ 64 bytes) ──────────────────────────
+
+/**
+ * Создаёт безопасный callback_data для кнопки "Получить текст".
+ * Payload (полный запрос) хранится в памяти; callback_data — короткий ключ.
+ */
+export function makeLyricsCallbackData(title: string, author: string): string {
+  const query = `${title} - ${author}`.slice(0, 200);
+  return storePayload("lyr", query); // "lyr:abcdefgh" = 12 bytes ✓
+}
+
+export { hasPrefix, getPayload };
 
 // ─── Main: download and send audio ───────────────────────────────────────────
 
@@ -207,28 +238,26 @@ export async function downloadAndSendAudio(
   track: TrackInfo,
   replyToMessageId?: number
 ): Promise<void> {
-  // Send "uploading audio" action
+  // Keep sending "upload_voice" action while downloading
   const actionInterval = setInterval(() => {
     bot.sendChatAction(chatId, "upload_voice").catch(() => {});
-  }, 4000);
+  }, 4500);
 
   let audioFile: string | null = null;
   try {
-    await bot.sendChatAction(chatId, "upload_voice").catch(() => {});
+    bot.sendChatAction(chatId, "upload_voice").catch(() => {});
     audioFile = await downloadAudio(track.videoId);
-
     clearInterval(actionInterval);
 
-    if (!audioFile) {
-      // Fallback: send link with buttons if download failed
-      await sendMusicLink(bot, chatId, track, replyToMessageId);
-      return;
-    }
-
+    const cbData = makeLyricsCallbackData(track.title, track.author);
     const dur = track.durationSec > 0 ? ` • ${formatDuration(track.durationSec)}` : "";
     const caption = `🎵 <b>${escapeHtml(track.title)}</b>\n👤 ${escapeHtml(track.author)}${dur}`;
 
-    const lyricsData = `lyrics:${encodeURIComponent((track.title + " " + track.author).slice(0, 180))}`;
+    if (!audioFile) {
+      // Fallback: send link
+      await sendMusicLink(bot, chatId, track, cbData, replyToMessageId);
+      return;
+    }
 
     await bot.sendAudio(chatId, audioFile, {
       caption,
@@ -239,32 +268,45 @@ export async function downloadAndSendAudio(
       reply_to_message_id: replyToMessageId,
       reply_markup: {
         inline_keyboard: [[
-          { text: "📜 Получить текст", callback_data: lyricsData },
+          { text: "📜 Получить текст", callback_data: cbData },
         ]],
       },
     } as TelegramBot.SendAudioOptions);
+
+    logger.info({ chatId, title: track.title, file: audioFile }, "Music: audio sent");
   } catch (err) {
     clearInterval(actionInterval);
-    logger.error({ err, chatId, track: track.videoId }, "downloadAndSendAudio failed");
-    // Fallback to link
-    await sendMusicLink(bot, chatId, track, replyToMessageId).catch(() => {});
+    logger.error({ err, chatId, videoId: track.videoId }, "downloadAndSendAudio error");
+    // Fallback to link on any error
+    const cbData = makeLyricsCallbackData(track.title, track.author);
+    await sendMusicLink(bot, chatId, track, cbData, replyToMessageId).catch(() => {});
   } finally {
     clearInterval(actionInterval);
-    if (audioFile) cleanUp(audioFile);
+    // Guaranteed cleanup — file is always deleted after send
+    if (audioFile) {
+      cleanUp(audioFile);
+      logger.debug({ file: audioFile }, "Music: temp file cleaned up");
+    }
   }
 }
 
-// ─── Fallback: send link if download fails ───────────────────────────────────
+// ─── Fallback: send link ──────────────────────────────────────────────────────
 
 async function sendMusicLink(
   bot: TelegramBot,
   chatId: number,
   track: TrackInfo,
+  cbData: string,
   replyToMessageId?: number
 ): Promise<void> {
   const dur = track.durationSec > 0 ? ` • ${formatDuration(track.durationSec)}` : "";
-  const text = `🎵 <b>${escapeHtml(track.title)}</b>\n👤 ${escapeHtml(track.author)}${dur}\n\n${track.url}\n\n<i>(не смог скачать — слушай по ссылке)</i>`;
-  const lyricsData = `lyrics:${encodeURIComponent((track.title + " " + track.author).slice(0, 180))}`;
+  const text = [
+    `🎵 <b>${escapeHtml(track.title)}</b>`,
+    `👤 ${escapeHtml(track.author)}${dur}`,
+    ``,
+    track.url,
+    `<i>(не смог скачать — слушай по ссылке)</i>`,
+  ].join("\n");
 
   await bot.sendMessage(chatId, text, {
     parse_mode: "HTML",
@@ -272,14 +314,60 @@ async function sendMusicLink(
     reply_to_message_id: replyToMessageId,
     reply_markup: {
       inline_keyboard: [[
-        { text: "📜 Получить текст", callback_data: lyricsData },
-        { text: "▶️ Открыть", url: track.url },
+        { text: "📜 Получить текст", callback_data: cbData },
+        { text: "▶️ YouTube", url: track.url },
       ]],
     },
   });
 }
 
-// ─── sendMusicResult (kept for compatibility) ─────────────────────────────────
+// ─── Lyrics callback ──────────────────────────────────────────────────────────
+
+export async function handleLyricsCallback(
+  bot: TelegramBot,
+  query: TelegramBot.CallbackQuery
+): Promise<void> {
+  const chatId = query.message?.chat.id;
+  const data = query.data ?? "";
+
+  // Answer IMMEDIATELY — removes spinner unconditionally
+  await bot.answerCallbackQuery(query.id, { text: "🔍 Ищу текст..." }).catch(() => {});
+
+  logger.info({ userId: query.from.id, data }, "Button pressed: lyrics");
+
+  if (!chatId) return;
+
+  // Resolve payload from in-memory store
+  const searchQuery = getPayload(data) ?? decodeURIComponent(data.replace(/^ly[rR]:/, ""));
+  if (!searchQuery) {
+    await bot.sendMessage(chatId, "⏳ Кнопка устарела — попроси трек снова", {
+      reply_to_message_id: query.message?.message_id,
+    });
+    return;
+  }
+
+  await bot.sendChatAction(chatId, "typing").catch(() => {});
+
+  const lyrics = await fetchLyrics(searchQuery);
+  if (!lyrics) {
+    await bot.sendMessage(chatId, "не нашёл текст — возможно его нет в открытом доступе(", {
+      reply_to_message_id: query.message?.message_id,
+    });
+    return;
+  }
+
+  // Split into 3800-char chunks
+  const CHUNK = 3800;
+  for (let i = 0; i < lyrics.length; i += CHUNK) {
+    const chunk = lyrics.slice(i, i + CHUNK);
+    await bot.sendMessage(chatId, `<pre>${escapeHtml(chunk)}</pre>`, {
+      parse_mode: "HTML",
+      reply_to_message_id: i === 0 ? query.message?.message_id : undefined,
+    });
+  }
+}
+
+// ─── sendMusicResult (compat) ─────────────────────────────────────────────────
 
 export async function sendMusicResult(
   bot: TelegramBot,
@@ -288,51 +376,4 @@ export async function sendMusicResult(
   replyToMessageId?: number
 ): Promise<void> {
   await downloadAndSendAudio(bot, chatId, track, replyToMessageId);
-}
-
-// ─── Lyrics callback handler ──────────────────────────────────────────────────
-
-export async function handleLyricsCallback(
-  bot: TelegramBot,
-  query: TelegramBot.CallbackQuery
-): Promise<void> {
-  const chatId = query.message?.chat.id;
-
-  // Answer IMMEDIATELY to remove spinner
-  await bot.answerCallbackQuery(query.id, { text: "🔍 Ищу текст..." }).catch(() => {});
-
-  if (!chatId) return;
-
-  const rawQuery = query.data?.replace(/^lyrics:/, "") ?? "";
-  const searchQuery = decodeURIComponent(rawQuery);
-
-  // Show typing
-  await bot.sendChatAction(chatId, "typing").catch(() => {});
-
-  const lyrics = await fetchLyrics(searchQuery);
-  if (!lyrics) {
-    await bot.sendMessage(chatId, "не нашёл текст, сорри(", {
-      reply_to_message_id: query.message?.message_id,
-    });
-    return;
-  }
-
-  // Split into 3800-char chunks to respect Telegram limit
-  const chunks: string[] = [];
-  for (let i = 0; i < lyrics.length; i += 3800) {
-    chunks.push(lyrics.slice(i, i + 3800));
-  }
-
-  for (let i = 0; i < chunks.length; i++) {
-    await bot.sendMessage(chatId, `<pre>${escapeHtml(chunks[i]!)}</pre>`, {
-      parse_mode: "HTML",
-      reply_to_message_id: i === 0 ? query.message?.message_id : undefined,
-    });
-  }
-}
-
-// ─── HTML escaping ────────────────────────────────────────────────────────────
-
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

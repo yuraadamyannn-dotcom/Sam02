@@ -19,7 +19,8 @@ import { analyzeSentiment, detectConflictContext } from "./utils/sentiment";
 import { checkFlood, isSpam } from "./utils/spam";
 
 // ─── Modules ──────────────────────────────────────────────────────────────────
-import { searchYouTube, downloadAndSendAudio, handleLyricsCallback } from "./music";
+import { searchYouTube, downloadAndSendAudio, handleLyricsCallback, hasPrefix } from "./music";
+import { storePayload, getPayload } from "./callback_store";
 import {
   handleDuel, handleDuelCallback, handleMarry, handleMarryCallback,
   handleDivorce, handleMarriageStatus, handleMafia, handleMafiaCallback, handleMafiaEnd,
@@ -308,10 +309,11 @@ async function sendVoiceMessage(chatId: number, text: string): Promise<void> {
   try {
     await bot.sendChatAction(chatId, "record_voice");
     await sleep(800);
+    const vtData = storePayload("vt", text.slice(0, 500));
     const voiceMsg = await bot.sendVoice(chatId, oggPath, {
       reply_markup: {
         inline_keyboard: [[
-          { text: "📝 Текст голосового", callback_data: `voice_text:${Buffer.from(text.slice(0, 200)).toString("base64")}` },
+          { text: "📝 Текст голосового", callback_data: vtData },
         ]],
       },
     });
@@ -1168,14 +1170,26 @@ bot.on("callback_query", async (query) => {
   const data = query.data ?? "";
   const chatId = query.message?.chat.id;
   const msgId = query.message?.message_id;
+  const userId = query.from.id;
 
+  // ── 1. НЕМЕДЛЕННО убираем "часики" — первый вызов всегда ──────────────────
+  await bot.answerCallbackQuery(query.id).catch(() => {});
+
+  // ── 2. Логируем каждое нажатие ────────────────────────────────────────────
+  logger.info({ data, userId, chatId }, `Button pressed: ${data}`);
+
+  // ── 3. Единый try/catch — пользователь всегда получит ответ ──────────────
   try {
+
     // Skills menu
     if (data.startsWith("skills:")) {
       const page = data.split(":")[1] as string;
+      if (page === "menu") {
+        if (chatId && msgId) await sendSkillsMenu(chatId, msgId);
+        return;
+      }
       const content = SKILLS_PAGES[page];
       if (content && chatId && msgId) {
-        await bot.answerCallbackQuery(query.id);
         await bot.editMessageText(content.text, {
           chat_id: chatId, message_id: msgId, parse_mode: "HTML",
           reply_markup: {
@@ -1188,28 +1202,45 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
-    if (data === "skills:menu") {
-      await bot.answerCallbackQuery(query.id);
-      if (chatId && msgId) await sendSkillsMenu(chatId, msgId);
+    // Lyrics (new short key: lyr:XXXXXXXX)
+    if (hasPrefix(data, "lyr") || data.startsWith("lyrics:")) {
+      await bot.answerCallbackQuery(query.id, { text: "🔍 Ищу текст..." }).catch(() => {});
+      await handleLyricsCallback(bot, query);
       return;
     }
 
-    // Voice text button
-    if (data.startsWith("voice_text:")) {
-      const encoded = data.replace("voice_text:", "");
-      try {
-        const text = Buffer.from(encoded, "base64").toString("utf-8");
-        await bot.answerCallbackQuery(query.id, { text: "Вот текст:" });
-        if (chatId) await bot.sendMessage(chatId, text, { reply_to_message_id: msgId });
-      } catch {
-        await bot.answerCallbackQuery(query.id, { text: "Не смог декодировать" });
+    // Voice text (new short key: vt:XXXXXXXX)
+    if (hasPrefix(data, "vt") || data.startsWith("voice_text:")) {
+      let text: string | null = null;
+      if (hasPrefix(data, "vt")) {
+        text = getPayload(data);
+      } else {
+        // Legacy base64 support
+        try {
+          text = Buffer.from(data.replace("voice_text:", ""), "base64").toString("utf-8");
+        } catch { /* */ }
+      }
+      if (text && chatId) {
+        await bot.answerCallbackQuery(query.id, { text: "📝 Вот текст:" }).catch(() => {});
+        await bot.sendMessage(chatId, `<pre>${text.replace(/</g, "&lt;")}</pre>`, {
+          parse_mode: "HTML",
+          reply_to_message_id: msgId,
+        });
+      } else {
+        await bot.answerCallbackQuery(query.id, { text: "⏳ Данные устарели" }).catch(() => {});
       }
       return;
     }
 
-    // Lyrics
-    if (data.startsWith("lyrics:")) {
-      await handleLyricsCallback(bot, query);
+    // Voice reply (new short key: vr:XXXXXXXX)
+    if (hasPrefix(data, "vr")) {
+      const text = getPayload(data);
+      if (text && chatId) {
+        await bot.answerCallbackQuery(query.id, { text: "🔊 Озвучиваю..." }).catch(() => {});
+        void sendVoiceMessage(chatId, text);
+      } else {
+        await bot.answerCallbackQuery(query.id, { text: "⏳ Данные устарели" }).catch(() => {});
+      }
       return;
     }
 
@@ -1239,28 +1270,32 @@ bot.on("callback_query", async (query) => {
 
     // /danni callbacks
     if (data.startsWith("danni_")) {
-      if (!isOwner(query.from.id)) { await bot.answerCallbackQuery(query.id, { text: "Нет прав" }); return; }
+      if (!isOwner(userId)) {
+        await bot.answerCallbackQuery(query.id, { text: "Нет прав" }).catch(() => {});
+        return;
+      }
       const [, action, userIdStr] = data.split(":");
       if (action === "delete" && userIdStr && chatId) {
         await db.delete(userMemoryTable).where(eq(userMemoryTable.userId, parseInt(userIdStr))).catch(() => {});
-        await bot.answerCallbackQuery(query.id, { text: "Данные удалены" });
+        await bot.answerCallbackQuery(query.id, { text: "Данные удалены" }).catch(() => {});
         await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
-      } else {
-        await bot.answerCallbackQuery(query.id);
       }
       return;
     }
 
-    // Moderation inline confirmations
-    if (data.startsWith("mod_")) {
-      await bot.answerCallbackQuery(query.id);
-      return;
-    }
+    // Moderation / fallback
+    if (data.startsWith("mod_")) return;
 
-    await bot.answerCallbackQuery(query.id);
   } catch (err) {
-    logger.error({ err }, "Callback query error");
-    await bot.answerCallbackQuery(query.id).catch(() => {});
+    logger.error({ err, data, userId }, "Callback query handler error");
+    // Уведомляем пользователя об ошибке
+    if (chatId) {
+      await bot.sendMessage(
+        chatId,
+        "Ошибка при обработке действия. Попробуй ещё раз.",
+        { reply_to_message_id: msgId }
+      ).catch(() => {});
+    }
   }
 });
 
@@ -1519,10 +1554,11 @@ bot.on("voice", async (msg) => {
     }
 
     const reply = await chat(msg.from.id, chatId, `[голосовое]: ${transcribed}`);
+    const vrData = storePayload("vr", reply.slice(0, 500));
     await sendWithTyping(chatId, reply, {
       reply_markup: {
         inline_keyboard: [[
-          { text: "🔊 Ответить голосом", callback_data: `voice_reply:${Buffer.from(reply.slice(0, 200)).toString("base64")}` },
+          { text: "🔊 Ответить голосом", callback_data: vrData },
         ]],
       },
     });
