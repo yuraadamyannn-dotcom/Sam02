@@ -10,3 +10,5 @@ export * from "./bot_chats";
 export * from "./user_analytics";
 export * from "./message_log";
 export * from "./moderation_config";
+export * from "./chat_events";
+export * from "./user_profiles";
