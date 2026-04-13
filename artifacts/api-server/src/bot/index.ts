@@ -21,6 +21,7 @@ import { checkFlood, isSpam } from "./utils/spam";
 // ─── Modules ──────────────────────────────────────────────────────────────────
 import { searchYouTube, downloadAndSendAudio, handleLyricsCallback, hasPrefix } from "./music";
 import { storePayload, getPayload } from "./callback_store";
+import { generateWaifu } from "./waifu";
 import {
   handleDuel, handleDuelCallback, handleMarry, handleMarryCallback,
   handleDivorce, handleMarriageStatus, handleMafia, handleMafiaCallback, handleMafiaEnd,
@@ -1232,6 +1233,63 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
+    // Waifu: regenerate same prompt (wi:) or alternate style (ws:)
+    if (hasPrefix(data, "wi") || hasPrefix(data, "ws")) {
+      const basePrompt = getPayload(data);
+      if (!basePrompt || !chatId) {
+        await bot.answerCallbackQuery(query.id, { text: "⏳ Промт устарел, напиши /waifu заново" }).catch(() => {});
+        return;
+      }
+
+      // Для альтернативного стиля — добавляем вариации
+      const styleVariants = [
+        "watercolor style, pastel colors, soft lighting",
+        "cyberpunk neon, dark background, glowing eyes",
+        "fantasy art, magical aura, enchanted forest",
+        "chibi style, super deformed, cute, round eyes",
+        "studio ghibli inspired, painterly, warm tones",
+      ];
+      const isAlternate = hasPrefix(data, "ws");
+      const finalPrompt = isAlternate
+        ? `${basePrompt}, ${styleVariants[Math.floor(Math.random() * styleVariants.length)]}`
+        : basePrompt;
+
+      await bot.answerCallbackQuery(query.id, { text: "🎨 Генерирую…" }).catch(() => {});
+
+      const loadingMsg = await bot.sendMessage(
+        chatId,
+        isAlternate ? "✨ Рисую в другом стиле…" : "🔄 Рисую снова…",
+      ).catch(() => null);
+
+      try {
+        await bot.sendChatAction(chatId, "upload_photo");
+        const result = await generateWaifu(finalPrompt);
+        if (loadingMsg) await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+
+        const modelShort = result.modelUsed.split("/")[1] ?? result.modelUsed;
+        const caption =
+          `🌸 <b>Аниме-арт</b>\n` +
+          `📝 <i>${finalPrompt.slice(0, 120)}${finalPrompt.length > 120 ? "…" : ""}</i>\n` +
+          `🤖 <code>${modelShort}</code>`;
+
+        await bot.sendPhoto(chatId, result.imageBuffer, {
+          caption,
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "🔄 Ещё раз", callback_data: storePayload("wi", basePrompt.slice(0, 400)) },
+              { text: "✨ Другой стиль", callback_data: storePayload("ws", basePrompt.slice(0, 400)) },
+            ]],
+          },
+        });
+      } catch (err) {
+        if (loadingMsg) await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+        logger.error({ err }, "Waifu callback generation failed");
+        await bot.sendMessage(chatId, "😔 Не получилось нарисовать — нейросеть перегружена, попробуй позже.").catch(() => {});
+      }
+      return;
+    }
+
     // Voice reply (new short key: vr:XXXXXXXX)
     if (hasPrefix(data, "vr")) {
       const text = getPayload(data);
@@ -1331,6 +1389,106 @@ bot.onText(/^\/help/, async (msg) => {
 bot.onText(/^\/skills/, async (msg) => {
   await trackBotChat(bot, msg);
   await sendSkillsMenu(msg.chat.id);
+});
+
+// ─── /waifu — аниме-генерация через Hugging Face ──────────────────────────────
+
+bot.onText(/^\/waifu(?:\s+(.+))?$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from?.id ?? chatId;
+  const prompt = match?.[1]?.trim();
+
+  // Если промт не передан — показываем подсказку
+  if (!prompt) {
+    await bot.sendMessage(
+      chatId,
+      "🎨 <b>Аниме-генератор</b>\n\n" +
+        "Напиши промт на английском:\n" +
+        "<code>/waifu girl with long silver hair, cherry blossom, kimono</code>\n\n" +
+        "Можно на русском — Сэм переведёт сам 😊",
+      { parse_mode: "HTML", reply_to_message_id: msg.message_id }
+    );
+    return;
+  }
+
+  // Если промт на русском — переводим через Groq перед генерацией
+  let finalPrompt = prompt;
+  const hasCyrillic = /[а-яёА-ЯЁ]/.test(prompt);
+  if (hasCyrillic) {
+    try {
+      const translateRes = await groq.chat.completions.create({
+        model: "llama-3.3-70b-versatile",
+        messages: [
+          {
+            role: "system",
+            content:
+              "Translate the following image generation prompt from Russian to English. " +
+              "Output only the translated prompt, nothing else. Keep proper nouns as-is. " +
+              "Optimise for Stable Diffusion — use descriptive adjectives.",
+          },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 200,
+        temperature: 0.2,
+      });
+      finalPrompt = translateRes.choices[0]?.message.content?.trim() ?? prompt;
+    } catch {
+      // Если перевод упал — используем оригинал
+    }
+  }
+
+  // Уведомляем пользователя — генерация занимает время
+  const loadingMsg = await bot.sendMessage(
+    chatId,
+    "🎨 Рисую аниме-арт, подожди немного…",
+    { reply_to_message_id: msg.message_id }
+  );
+
+  try {
+    await bot.sendChatAction(chatId, "upload_photo");
+
+    const result = await generateWaifu(finalPrompt);
+
+    // Удаляем «рисую…» сообщение
+    await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+
+    const modelShort = result.modelUsed.split("/")[1] ?? result.modelUsed;
+    const caption =
+      `🌸 <b>Аниме-арт для ${msg.from?.first_name ?? "тебя"}</b>\n` +
+      `📝 <i>${finalPrompt.slice(0, 120)}${finalPrompt.length > 120 ? "…" : ""}</i>\n` +
+      `🤖 <code>${modelShort}</code>`;
+
+    await bot.sendPhoto(chatId, result.imageBuffer, {
+      caption,
+      parse_mode: "HTML",
+      reply_to_message_id: msg.message_id,
+      reply_markup: {
+        inline_keyboard: [[
+          {
+            text: "🔄 Ещё раз",
+            callback_data: storePayload("wi", finalPrompt.slice(0, 400)),
+          },
+          {
+            text: "✨ Другой стиль",
+            callback_data: storePayload("ws", finalPrompt.slice(0, 400)),
+          },
+        ]],
+      },
+    });
+
+    logger.info({ userId, prompt: finalPrompt }, "Waifu sent");
+  } catch (err) {
+    await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error({ err: errMsg, userId }, "Waifu generation failed");
+
+    await bot.sendMessage(
+      chatId,
+      "😔 Не получилось нарисовать — нейросеть временно перегружена.\n" +
+        "Попробуй через минуту или измени промт.",
+      { reply_to_message_id: msg.message_id }
+    );
+  }
 });
 
 bot.onText(/^\/clear/, async (msg) => {
