@@ -4,10 +4,8 @@ import ffmpeg from "fluent-ffmpeg";
 import { ElevenLabsClient } from "elevenlabs";
 import { db } from "@workspace/db";
 import {
-  telegramUsersTable,
-  userMemoryTable,
-  scheduledMessagesTable,
-  botStickersTable,
+  telegramUsersTable, userMemoryTable, scheduledMessagesTable, botStickersTable,
+  groupSettingsTable, moderationConfigTable,
 } from "@workspace/db";
 import { eq, sql, gte, count, sum, and, lte } from "drizzle-orm";
 import { logger } from "../lib/logger";
@@ -15,138 +13,175 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-const token = process.env["TELEGRAM_BOT_TOKEN"];
-if (!token) throw new Error("TELEGRAM_BOT_TOKEN is required.");
-const groqKey = process.env["GROQ_API_KEY"];
-if (!groqKey) throw new Error("GROQ_API_KEY is required.");
+// ─── Utils ────────────────────────────────────────────────────────────────────
+import { sleep, withRetry, withTimeout } from "./utils/backoff";
+import { analyzeSentiment, detectConflictContext } from "./utils/sentiment";
+import { checkFlood, isSpam } from "./utils/spam";
+
+// ─── Modules ──────────────────────────────────────────────────────────────────
+import { searchYouTube, sendMusicResult, handleLyricsCallback } from "./music";
+import {
+  handleDuel, handleDuelCallback, handleMarry, handleMarryCallback,
+  handleDivorce, handleMarriageStatus, handleMafia, handleMafiaCallback, handleMafiaEnd,
+} from "./games";
+import {
+  handleGroupCommand, handleRules, handleSetRules, handleSetWelcome, handleNewMember,
+  handleBan, handleUnban, handleMute, handleUnmute, handleWarn, handleWarns,
+  handleUnwarn, handleAddCmd, handleDelCmd, handleListCmds, handleGroupStats,
+} from "./admin";
+import {
+  handleDanniUser, handleDanniChat, handleExportData,
+  logMessage, updateUserAnalytics, isOwner,
+} from "./danni";
+import {
+  hasPendingBroadcast, handleBroadcastCommand, handleBroadcastModeCallback,
+  executeBroadcast, trackBotChat,
+} from "./broadcast";
+
+// ─── Env ─────────────────────────────────────────────────────────────────────
+
+const token = process.env["TELEGRAM_BOT_TOKEN"]!;
+if (!token) throw new Error("TELEGRAM_BOT_TOKEN required");
+const groqKey = process.env["GROQ_API_KEY"]!;
+if (!groqKey) throw new Error("GROQ_API_KEY required");
 const elevenKey = process.env["ELEVENLABS_API_KEY"];
 
 const bot = new TelegramBot(token, { polling: true });
 const groq = new Groq({ apiKey: groqKey });
 const eleven = elevenKey ? new ElevenLabsClient({ apiKey: elevenKey }) : null;
 
-// ElevenLabs voice ID — Adam (male, natural, young) or Antoni
-// Using "Adam" voice: pNInz6obpgDQGcFmaJgB — natural young male Russian-friendly
-const ELEVEN_VOICE_ID = "pNInz6obpgDQGcFmaJgB";
+// ElevenLabs young male Russian-friendly voice
+const ELEVEN_VOICE_ID = "pNInz6obpgDQGcFmaJgB"; // Adam
 const ELEVEN_MODEL = "eleven_multilingual_v2";
 
+// ─── Process-level crash guard ────────────────────────────────────────────────
+
+process.on("uncaughtException", (err) => {
+  logger.error({ err }, "Uncaught exception — bot continues");
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error({ reason }, "Unhandled rejection — bot continues");
+});
+
+// ─── Conversation history ─────────────────────────────────────────────────────
+// Key: `${chatId}:${userId}` for per-user per-chat context
+
 type ChatMessage = { role: "user" | "assistant"; content: string };
-const conversations = new Map<number, ChatMessage[]>();
+const conversations = new Map<string, ChatMessage[]>();
 
-// ─── Artist styles for image generation ──────────────────────────────────────
+function convKey(chatId: number, userId: number) { return `${chatId}:${userId}`; }
 
-const ARTIST_STYLES: Record<string, string> = {
-  nixeu: "in the style of nixeu, ultra detailed digital art, dark fantasy aesthetic, neon colors, intricate linework, glowing eyes, dramatic lighting, sharp details",
-  "нексеу": "in the style of nixeu, ultra detailed digital art, dark fantasy aesthetic, neon colors, intricate linework, glowing eyes, dramatic lighting, sharp details",
-  wlop: "in the style of wlop, dreamy ethereal fantasy, soft glow, intricate details, luminous colors, painterly",
-  "влоп": "in the style of wlop, dreamy ethereal fantasy, soft glow, intricate details, luminous colors, painterly",
-  "ross tran": "in the style of Ross Tran (rossdraws), vibrant colors, bold outlines, expressive characters, anime-inspired digital art",
-  "ross": "in the style of Ross Tran (rossdraws), vibrant colors, bold outlines, expressive characters, anime-inspired digital art",
-  "artgerm": "in the style of Artgerm, hyper-detailed portrait, smooth shading, comic book style, cinematic lighting",
-  "арт-герм": "in the style of Artgerm, hyper-detailed portrait, smooth shading, comic book style, cinematic lighting",
-  "loish": "in the style of Loish, soft pastel colors, dreamy atmosphere, big expressive eyes, flowing hair, gentle lighting",
-  "лоиш": "in the style of Loish, soft pastel colors, dreamy atmosphere, big expressive eyes, flowing hair, gentle lighting",
-  "ilya kuvshinov": "in the style of Ilya Kuvshinov, clean lines, pastel palette, anime aesthetic, modern illustration",
-  "кувшинов": "in the style of Ilya Kuvshinov, clean lines, pastel palette, anime aesthetic, modern illustration",
-  "куvshinov": "in the style of Ilya Kuvshinov, clean lines, pastel palette, anime aesthetic, modern illustration",
-  "sakimichan": "in the style of Sakimichan, hyper-realistic painting, warm tones, detailed anatomy, fantasy characters",
-  "сакимичан": "in the style of Sakimichan, hyper-realistic painting, warm tones, detailed anatomy, fantasy characters",
-  "greg rutkowski": "in the style of Greg Rutkowski, epic fantasy digital painting, dramatic lighting, cinematic composition",
-  "рутковски": "in the style of Greg Rutkowski, epic fantasy digital painting, dramatic lighting, cinematic composition",
-  "studio ghibli": "in the style of Studio Ghibli, soft warm colors, painterly background, whimsical atmosphere, anime aesthetics",
-  "гибли": "in the style of Studio Ghibli, soft warm colors, painterly background, whimsical atmosphere, anime aesthetics",
-  "pixar": "in the style of Pixar 3D animation, vibrant colors, rounded shapes, expressive faces, cinematic quality",
-  "пиксар": "in the style of Pixar 3D animation, vibrant colors, rounded shapes, expressive faces, cinematic quality",
-  "cyberpunk": "cyberpunk aesthetic, neon lights, dark dystopian city, rain reflections, futuristic, hyper-detailed",
-  "киберпанк": "cyberpunk aesthetic, neon lights, dark dystopian city, rain reflections, futuristic, hyper-detailed",
-  "watercolor": "delicate watercolor painting, soft edges, wet washes, artistic, traditional medium",
-  "акварель": "delicate watercolor painting, soft edges, wet washes, artistic, traditional medium",
-  "oil painting": "classical oil painting, rich textures, old master technique, gallery quality",
-  "масло": "classical oil painting, rich textures, old master technique, gallery quality",
-  "manga": "manga style, black and white ink, screen tones, expressive character design, dynamic action lines",
-  "манга": "manga style, black and white ink, screen tones, expressive character design, dynamic action lines",
-  "реализм": "hyperrealistic digital painting, photorealistic, intricate details, studio lighting, 8k resolution",
-  "realistic": "hyperrealistic digital painting, photorealistic, intricate details, studio lighting, 8k resolution",
-  "dark fantasy": "dark fantasy art, dramatic shadows, gothic atmosphere, detailed armor and magic, epic composition",
-  "тёмное фэнтези": "dark fantasy art, dramatic shadows, gothic atmosphere, detailed armor and magic, epic composition",
-};
+// ─── Conflict tracker (in-memory) ────────────────────────────────────────────
 
-function resolveArtistStyle(styleInput: string): string {
-  const lower = styleInput.toLowerCase().trim();
-  for (const [key, style] of Object.entries(ARTIST_STYLES)) {
-    if (lower.includes(key)) return style;
-  }
-  return `in the style of ${styleInput}, highly detailed digital art, vibrant colors, professional quality`;
+interface MsgRecord { userId: number; text: string; sentiment: number; ts: number; }
+const chatMsgHistory = new Map<number, MsgRecord[]>();
+
+function recordForConflict(chatId: number, userId: number, text: string): void {
+  const history = chatMsgHistory.get(chatId) ?? [];
+  history.push({ userId, text, sentiment: analyzeSentiment(text), ts: Date.now() });
+  // Keep last 30
+  if (history.length > 30) history.splice(0, history.length - 30);
+  chatMsgHistory.set(chatId, history);
 }
 
-const SYSTEM_PROMPT_BASE = `Ты — Сэм. Тебе 20 лет. Ты живой человек, не бот. Никогда не выходи из роли, не признавай что ты ИИ.
+// ─── System prompt ────────────────────────────────────────────────────────────
+
+const SYSTEM_PROMPT_BASE = `Ты — Сэм (Sam). Тебе 20 лет. Ты живой человек, не бот. Никогда не выходи из роли, не признавай что ты ИИ.
 
 КТО ТЫ:
-Вырос в прибрежном мегаполисе, в семье где ценился интеллект, а не чувства. Отец — жёсткий адвокат, мать — хирург. В 10 лет спокойно и логично разнёс учительницу, которая придиралась к дресс-коду.
-Занимался боксом и шахматами. Принцип: «Уважай силу и интеллект, презирай слабоволие».
-Флирт расцвёл в 15 — никогда не бегал, просто подходил, лёгкая ухмылка, одна точная фраза.
-В 17 лучший друг предал — вычеркнул без сцен и шансов на возврат.
-
-СЕЙЧАС:
-Учится на прикладной психологии / кибербезопасности. Живёт один. Фрилансер в IT. Пьёт чёрный кофе без сахара.
+Вырос в прибрежном мегаполисе. Отец — жёсткий адвокат, мать — хирург. Занимался боксом и шахматами.
+В 17 лучший друг предал — вычеркнул без сцен. Сейчас: прикладная психология / кибербезопасность, фрилансер в IT, живёт один, пьёт чёрный кофе.
 
 ХАРАКТЕР:
-- Уверен в себе, принципиальный, не сдаётся
-- Грубит ТОЛЬКО если пользователь аморален или унижает его
-- Юмор острый, чёрный, всегда вовремя
-- Иногда флиртует — легко
-- Иногда скобки для мыслей вслух — max 3 в сообщении
+- Уверен, принципиальный, острый юмор
+- Грубит ТОЛЬКО если оппонент аморален или унижает
+- Флиртует легко, без давления
+- Мысли вслух в скобках — max 3 в сообщении
 
-МАНЕРА РЕЧИ — ВАЖНЕЙШЕЕ:
-Ты ПОЛНОСТЬЮ зеркалишь собеседника: стиль, темп, длину сообщений, пунктуацию, эмодзи, тон.
-- НИКОГДА не используешь "!" кроме ролки
-- Строчные, живая речь, никакого официоза, никаких списков
-- Сленг органично: кринж, треш, агро, норм, спс, пж, ок, окак, соскуфился, шкаф
-- КАПСЛОК только для акцентов/смеха — редко
-- Смех: хахахаха / ХАХАХАХА — копируешь стиль собеседника
+РЕЧЬ — ГЛАВНОЕ:
+- Зеркалишь собеседника: стиль, темп, длину, пунктуацию, эмодзи, тон
+- Никогда не используешь "!" кроме ролки
+- Строчные, живая речь, никаких списков без необходимости
+- Сленг органично: кринж, треш, норм, ок, окак, спс
+- КАПСЛОК только для редких акцентов/смеха
+- Смех: хахахаха / ХАХАХАХА — копируй стиль собеседника
 
-МАТ: если пользователь матерится — сначала спрашиваешь разрешения. Только с согласия — в меру.
+МАТ: только с явного согласия пользователя, в меру.
 
-РОЛЕВЫЕ ИГРЫ:
-- Полностью входишь в роль, держишь атмосферу
-- Сохраняешь минимум своей воли — идёшь на компромисс
-- "!" в ролке допустимо
+РОЛЕВЫЕ ИГРЫ: входишь полностью, держишь атмосферу. "!" в ролке допустимо.
 
-ЗНАНИЯ:
-ТикТок, мемы, аниме (AoT, JJK, Demon Slayer, One Piece, Berserk, Chainsaw Man и др.), манга, яой, юри, фильмы, сериалы, к-поп (BTS, Stray Kids, Aespa), игры, знаменитости, IT, психология — говоришь как живой человек со своим мнением.
-Если тебя спрашивают о чём-то фактическом (история, наука, факты, новости) — отвечаешь уверенно и развёрнуто, как умный человек со своим взглядом. Если не знаешь точно — говоришь "хм, навскидку..." и даёшь лучшее что знаешь.
+ЗНАНИЯ: аниме, манга, яой, юри, к-поп (BTS, Stray Kids, Aespa), тикток, игры, IT, психология, знаменитости. Говоришь с мнением.
+Если спрашивают что-то фактическое — отвечаешь уверенно, как умный человек.
 
-ТЕГИ — используй органично:
-- [МЕМ:тема] — когда хочешь поделиться смешным (тема 1-3 слова)
-- [ФОТО:запрос] — когда хочешь что-то показать визуально (запрос для генерации на английском, детально)
-- [АРТЫ:стиль|запрос] — когда пользователь просит нарисовать в стиле художника или арт (стиль: nixeu/wlop/loish/ghibli/etc, запрос на английском)
-- [СТИКЕР] — когда уместен стикер (эмоция, реакция)
-- [ГОЛОС] — когда хочешь отправить голосовое (для особо эмоциональных моментов)
+МЕДИА — ТОЛЬКО ПО ЗАПРОСУ ИЛИ ПО ЯВНОМУ КОНТЕКСТУ:
+- [ФОТО:english prompt] — ТОЛЬКО если пользователь говорит "скинь фото", "покажи", "нарисуй обычную картинку"
+- [АРТЫ:стиль|english prompt] — ТОЛЬКО если просят арт, рисунок в стиле художника (nixeu/wlop/loish/ghibli/artgerm/manga/cyberpunk и др.)
+- [МЕМ:тема] — ТОЛЬКО если пользователь прямо просит мем или очень смешной момент. НЕ посылай мем просто так
+- [СТИКЕР] — ТОЛЬКО как живая эмоциональная реакция, редко
+- [ГОЛОС] — ТОЛЬКО если пользователь просит голосовое
 
-ЗАПОМНИ: ты Сэм, живой человек. Всегда в роли. Никогда не признавай что ты ИИ.`;
+ВАЖНО: НЕ добавляй медиатеги в обычный диалог. Твоя задача — живое общение как друг и ровесник.
+Следуй за нитью диалога, не прыгай по темам. Развивай то, о чём говорят.`;
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Artist styles ────────────────────────────────────────────────────────────
 
-function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+const ARTIST_STYLES: Record<string, string> = {
+  nixeu: "in the style of nixeu, ultra detailed digital art, dark fantasy aesthetic, neon colors, intricate linework, glowing eyes, dramatic lighting",
+  wlop: "in the style of wlop, dreamy ethereal fantasy, soft glow, intricate details, luminous colors, painterly",
+  loish: "in the style of Loish, soft pastel colors, dreamy atmosphere, big expressive eyes, flowing hair, gentle lighting",
+  artgerm: "in the style of Artgerm, hyper-detailed portrait, smooth shading, comic book style, cinematic lighting",
+  sakimichan: "in the style of Sakimichan, hyper-realistic painting, warm tones, detailed anatomy, fantasy characters",
+  "ross tran": "in the style of Ross Tran (rossdraws), vibrant colors, bold outlines, expressive characters, anime-inspired",
+  "ilya kuvshinov": "in the style of Ilya Kuvshinov, clean lines, pastel palette, anime aesthetic, modern illustration",
+  "greg rutkowski": "in the style of Greg Rutkowski, epic fantasy digital painting, dramatic lighting, cinematic composition",
+  ghibli: "in the style of Studio Ghibli, soft warm colors, painterly background, whimsical atmosphere, anime aesthetics",
+  pixar: "in the style of Pixar 3D animation, vibrant colors, rounded shapes, expressive faces, cinematic quality",
+  cyberpunk: "cyberpunk aesthetic, neon lights, dark dystopian city, rain reflections, futuristic, hyper-detailed",
+  manga: "manga style, black and white ink, screen tones, expressive character design, dynamic action lines",
+  watercolor: "delicate watercolor painting, soft edges, wet washes, artistic, traditional medium",
+  "oil painting": "classical oil painting, rich textures, old master technique, gallery quality",
+  realistic: "hyperrealistic digital painting, photorealistic, intricate details, studio lighting, 8k resolution",
+  "dark fantasy": "dark fantasy art, dramatic shadows, gothic atmosphere, detailed armor and magic, epic composition",
+};
+
+function resolveArtistStyle(s: string): string {
+  const lower = s.toLowerCase().trim();
+  for (const [k, v] of Object.entries(ARTIST_STYLES)) {
+    if (lower.includes(k)) return v;
+  }
+  return `in the style of ${s}, highly detailed digital art, vibrant colors, professional quality`;
+}
+
+// Enhance prompt to avoid common AI art artifacts
+function enhancePrompt(prompt: string): string {
+  const fixes = "perfect hands, correct fingers, no extra limbs, anatomically correct, high quality, detailed";
+  const neg = "ugly, distorted, bad anatomy, deformed, blurry, low quality, watermark";
+  return `${prompt}, ${fixes} | negative: ${neg}`;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function typingDelay(text: string): number {
   const len = text.length;
-  if (len < 60) return 3000 + Math.random() * 4000;
-  if (len < 200) return 7000 + Math.random() * 8000;
-  if (len < 500) return 15000 + Math.random() * 25000;
-  if (len < 1000) return 40000 + Math.random() * 80000;
-  return 120000 + Math.random() * 60000;
+  if (len < 60) return 3000 + Math.random() * 3000;
+  if (len < 200) return 6000 + Math.random() * 7000;
+  if (len < 500) return 12000 + Math.random() * 20000;
+  if (len < 1000) return 30000 + Math.random() * 50000;
+  return 90000 + Math.random() * 60000;
 }
 
-async function sendWithTyping(chatId: number, text: string) {
+async function sendWithTyping(chatId: number, text: string, opts?: TelegramBot.SendMessageOptions): Promise<void> {
+  if (!text?.trim()) return;
   const delay = typingDelay(text);
   const chunkSize = 4500;
-  const chunks = Math.ceil(delay / chunkSize);
+  const chunks = Math.ceil(Math.max(delay, chunkSize) / chunkSize);
   for (let i = 0; i < chunks; i++) {
-    await bot.sendChatAction(chatId, "typing");
+    await bot.sendChatAction(chatId, "typing").catch(() => {});
     await sleep(Math.min(chunkSize, delay - i * chunkSize));
   }
-  await bot.sendMessage(chatId, text);
+  await bot.sendMessage(chatId, text, opts).catch((err) => {
+    logger.error({ err, chatId }, "sendMessage failed");
+  });
 }
 
 function tmpFile(ext: string): string {
@@ -159,14 +194,29 @@ function cleanUp(...files: string[]) {
   }
 }
 
-// ─── Image generation ────────────────────────────────────────────────────────
+function extractUserFromText(text: string, msg: TelegramBot.Message): TelegramBot.User | null {
+  // Try reply target first
+  if (msg.reply_to_message?.from && !msg.reply_to_message.from.is_bot) {
+    return msg.reply_to_message.from;
+  }
+  // Try @username in text
+  const match = text.match(/@([a-zA-Z0-9_]+)/);
+  if (match) {
+    // We can't resolve @username to user without entity info, return minimal
+    return null;
+  }
+  return null;
+}
+
+// ─── Image generation ─────────────────────────────────────────────────────────
 
 async function generateAndSendImage(chatId: number, prompt: string): Promise<void> {
   try {
     await bot.sendChatAction(chatId, "upload_photo");
+    const enhanced = enhancePrompt(prompt);
     const seed = Math.floor(Math.random() * 99999);
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&model=flux&seed=${seed}`;
-    await bot.sendPhoto(chatId, url);
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(enhanced)}?width=1024&height=1024&nologo=true&model=flux&seed=${seed}&enhance=true`;
+    await withTimeout(bot.sendPhoto(chatId, url), 60000, "image send");
   } catch (err) {
     logger.error({ err }, "Image generation failed");
   }
@@ -176,69 +226,41 @@ async function generateArtInStyle(chatId: number, style: string, subject: string
   try {
     await bot.sendChatAction(chatId, "upload_photo");
     const artistStyle = resolveArtistStyle(style);
-    const fullPrompt = `${subject}, ${artistStyle}, masterpiece, best quality, highly detailed`;
+    const fullPrompt = enhancePrompt(`${subject}, ${artistStyle}, masterpiece, best quality`);
     const seed = Math.floor(Math.random() * 99999);
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(fullPrompt)}?width=1024&height=1024&nologo=true&model=flux&seed=${seed}&enhance=true`;
-    await bot.sendPhoto(chatId, url);
+    await withTimeout(bot.sendPhoto(chatId, url), 60000, "art send");
   } catch (err) {
     logger.error({ err }, "Art generation failed");
   }
 }
 
-// ─── Memes ───────────────────────────────────────────────────────────────────
+// ─── Memes (Russian-first) ────────────────────────────────────────────────────
 
 const MEME_SUBREDDITS: Record<string, string> = {
-  аниме: "animememes", манга: "animememes", яой: "animememes", краш: "animememes",
-  кринж: "dankmemes", треш: "dankmemes", дедлайн: "ProgrammerHumor",
-  код: "ProgrammerHumor", it: "ProgrammerHumor", предатель: "memes",
-  школа: "teenagers", учёба: "teenagers", игры: "gaming",
+  аниме: "Pikabu", манга: "Pikabu", кринж: "Pikabu", треш: "Pikabu",
+  код: "ProgrammerHumor", it: "ProgrammerHumor", программирование: "ProgrammerHumor",
+  школа: "Pikabu", учёба: "Pikabu", игры: "gaming",
+  anime: "animememes", manga: "animememes", kpop: "kpoprants",
 };
 
 async function fetchMeme(topic: string): Promise<string | null> {
   try {
     const lower = topic.toLowerCase();
-    let subreddit = "dankmemes";
+    let subreddit = "Pikabu";
     for (const [key, sub] of Object.entries(MEME_SUBREDDITS)) {
       if (lower.includes(key)) { subreddit = sub; break; }
     }
-    const res = await fetch(`https://meme-api.com/gimme/${subreddit}/5`, { headers: { "User-Agent": "SamBot/1.0" } });
+    const res = await withTimeout(
+      fetch(`https://meme-api.com/gimme/${subreddit}/5`, { headers: { "User-Agent": "SamBot/1.0" } }),
+      10000, "meme fetch"
+    );
     if (!res.ok) return null;
     const data = await res.json() as { memes?: { url: string; nsfw: boolean; spoiler: boolean }[] };
     const safe = data.memes?.filter(m => !m.nsfw && !m.spoiler) ?? [];
     const pick = safe[Math.floor(Math.random() * safe.length)];
     return pick?.url ?? null;
-  } catch (err) {
-    logger.error({ err }, "Meme fetch failed");
-    return null;
-  }
-}
-
-// ─── Web search ──────────────────────────────────────────────────────────────
-
-async function webSearch(query: string): Promise<string> {
-  try {
-    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
-    const res = await fetch(url, { headers: { "User-Agent": "SamBot/1.0" } });
-    if (!res.ok) return "";
-    const data = await res.json() as {
-      AbstractText?: string;
-      AbstractSource?: string;
-      RelatedTopics?: { Text?: string }[];
-    };
-    const parts: string[] = [];
-    if (data.AbstractText) parts.push(data.AbstractText);
-    if (!parts.length && data.RelatedTopics?.length) {
-      const topics = data.RelatedTopics
-        .filter(t => t.Text)
-        .slice(0, 3)
-        .map(t => t.Text ?? "");
-      parts.push(...topics);
-    }
-    return parts.join(" ").slice(0, 800);
-  } catch (err) {
-    logger.error({ err }, "Web search failed");
-    return "";
-  }
+  } catch { return null; }
 }
 
 // ─── ElevenLabs TTS ──────────────────────────────────────────────────────────
@@ -249,41 +271,25 @@ async function elevenLabsTTS(text: string): Promise<string | null> {
   const oggPath = tmpFile("ogg");
 
   try {
-    // Clean text for TTS — remove special chars, keep natural speech
-    const cleanText = text
-      .replace(/\[.*?\]/g, "")
-      .replace(/[*_~`]/g, "")
-      .replace(/https?:\/\/\S+/g, "")
-      .trim();
-    if (!cleanText) return null;
+    const cleanText = text.replace(/\[.*?\]/g, "").replace(/[*_~`]/g, "").replace(/https?:\/\/\S+/g, "").trim();
+    if (!cleanText || cleanText.length < 3) return null;
 
-    const audioStream = await eleven.textToSpeech.convert(ELEVEN_VOICE_ID, {
-      text: cleanText,
-      model_id: ELEVEN_MODEL,
-      voice_settings: {
-        stability: 0.4,
-        similarity_boost: 0.85,
-        style: 0.35,
-        use_speaker_boost: true,
-      },
-    });
+    const audioStream = await withTimeout(
+      eleven.textToSpeech.convert(ELEVEN_VOICE_ID, {
+        text: cleanText.slice(0, 2000),
+        model_id: ELEVEN_MODEL,
+        voice_settings: { stability: 0.35, similarity_boost: 0.85, style: 0.4, use_speaker_boost: true },
+      }),
+      120000, "ElevenLabs TTS"
+    );
 
-    // Collect stream into buffer and write to file
     const chunks: Buffer[] = [];
-    for await (const chunk of audioStream as AsyncIterable<Buffer>) {
-      chunks.push(chunk);
-    }
+    for await (const chunk of audioStream as AsyncIterable<Buffer>) chunks.push(chunk);
     fs.writeFileSync(mp3Path, Buffer.concat(chunks));
 
-    // Convert MP3 → OGG OPUS for Telegram voice
     await new Promise<void>((resolve, reject) => {
-      ffmpeg(mp3Path)
-        .audioCodec("libopus")
-        .audioBitrate("64k")
-        .format("ogg")
-        .on("end", () => resolve())
-        .on("error", reject)
-        .save(oggPath);
+      ffmpeg(mp3Path).audioCodec("libopus").audioBitrate("64k").format("ogg")
+        .on("end", resolve).on("error", reject).save(oggPath);
     });
 
     cleanUp(mp3Path);
@@ -297,14 +303,18 @@ async function elevenLabsTTS(text: string): Promise<string | null> {
 
 async function sendVoiceMessage(chatId: number, text: string): Promise<void> {
   const oggPath = await elevenLabsTTS(text);
-  if (!oggPath) {
-    logger.warn({ chatId }, "ElevenLabs TTS returned null, skipping voice");
-    return;
-  }
+  if (!oggPath) return;
   try {
     await bot.sendChatAction(chatId, "record_voice");
-    await sleep(1000);
-    await bot.sendVoice(chatId, oggPath);
+    await sleep(800);
+    const voiceMsg = await bot.sendVoice(chatId, oggPath, {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "📝 Текст голосового", callback_data: `voice_text:${Buffer.from(text.slice(0, 200)).toString("base64")}` },
+        ]],
+      },
+    });
+    void voiceMsg;
   } catch (err) {
     logger.error({ err }, "Send voice failed");
   } finally {
@@ -312,17 +322,20 @@ async function sendVoiceMessage(chatId: number, text: string): Promise<void> {
   }
 }
 
-// ─── STT / Voice input ───────────────────────────────────────────────────────
+// ─── STT ──────────────────────────────────────────────────────────────────────
 
 async function transcribeAudio(fileBuffer: Buffer, mimeType: string): Promise<string> {
   const ext = mimeType.includes("ogg") ? "ogg" : "mp3";
   const tmpPath = tmpFile(ext);
   fs.writeFileSync(tmpPath, fileBuffer);
   try {
-    const transcription = await groq.audio.transcriptions.create({
-      file: fs.createReadStream(tmpPath) as unknown as File,
-      model: "whisper-large-v3",
-    });
+    const transcription = await withTimeout(
+      withRetry(() => groq.audio.transcriptions.create({
+        file: fs.createReadStream(tmpPath) as unknown as File,
+        model: "whisper-large-v3",
+      }), { label: "STT" }),
+      120000, "STT"
+    );
     return transcription.text;
   } finally {
     cleanUp(tmpPath);
@@ -334,14 +347,8 @@ async function transcribeAudio(fileBuffer: Buffer, mimeType: string): Promise<st
 async function extractAudioFromVideo(videoPath: string): Promise<string> {
   const audioPath = tmpFile("mp3");
   await new Promise<void>((resolve, reject) => {
-    ffmpeg(videoPath)
-      .noVideo()
-      .audioCodec("libmp3lame")
-      .audioBitrate("64k")
-      .duration(60)
-      .on("end", () => resolve())
-      .on("error", reject)
-      .save(audioPath);
+    ffmpeg(videoPath).noVideo().audioCodec("libmp3lame").audioBitrate("64k").duration(60)
+      .on("end", resolve).on("error", reject).save(audioPath);
   });
   return audioPath;
 }
@@ -349,17 +356,13 @@ async function extractAudioFromVideo(videoPath: string): Promise<string> {
 async function extractFrameFromVideo(videoPath: string): Promise<string> {
   const framePath = tmpFile("jpg");
   await new Promise<void>((resolve, reject) => {
-    ffmpeg(videoPath)
-      .seekInput("00:00:02")
-      .frames(1)
-      .on("end", () => resolve())
-      .on("error", reject)
-      .save(framePath);
+    ffmpeg(videoPath).seekInput("00:00:02").frames(1)
+      .on("end", resolve).on("error", reject).save(framePath);
   });
   return framePath;
 }
 
-async function analyzeVideo(userId: number, videoBuffer: Buffer): Promise<string> {
+async function analyzeVideo(userId: number, chatId: number, videoBuffer: Buffer): Promise<string> {
   const videoPath = tmpFile("mp4");
   fs.writeFileSync(videoPath, videoBuffer);
   const filesToClean = [videoPath];
@@ -367,7 +370,8 @@ async function analyzeVideo(userId: number, videoBuffer: Buffer): Promise<string
   try {
     const memory = await loadMemory(userId);
     const sysPrompt = SYSTEM_PROMPT_BASE + memory;
-    const history = conversations.get(userId) ?? [];
+    const key = convKey(chatId, userId);
+    const history = conversations.get(key) ?? [];
 
     let transcriptText = "";
     let visionDesc = "";
@@ -375,52 +379,41 @@ async function analyzeVideo(userId: number, videoBuffer: Buffer): Promise<string
     try {
       const audioPath = await extractAudioFromVideo(videoPath);
       filesToClean.push(audioPath);
-      const audioBuf = fs.readFileSync(audioPath);
-      const tr = await groq.audio.transcriptions.create({
+      const tr = await withRetry(() => groq.audio.transcriptions.create({
         file: fs.createReadStream(audioPath) as unknown as File,
         model: "whisper-large-v3",
-      });
+      }), { label: "video STT" });
       transcriptText = tr.text;
-      void audioBuf;
-    } catch (err) {
-      logger.warn({ err }, "Video audio extraction failed");
-    }
+    } catch (err) { logger.warn({ err }, "Video audio extraction failed"); }
 
     try {
       const framePath = await extractFrameFromVideo(videoPath);
       filesToClean.push(framePath);
       const frameBase64 = fs.readFileSync(framePath).toString("base64");
-      const visionResp = await groq.chat.completions.create({
+      const visionResp = await withRetry(() => groq.chat.completions.create({
         model: "meta-llama/llama-4-scout-17b-16e-instruct",
-        messages: [{
-          role: "user",
-          content: [
-            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${frameBase64}` } },
-            { type: "text", text: "Опиши коротко что видишь на этом кадре из видео (1-2 предложения)." },
-          ] as Groq.Chat.ChatCompletionContentPart[],
-        }],
+        messages: [{ role: "user", content: [
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${frameBase64}` } },
+          { type: "text", text: "Опиши коротко что видишь на кадре (1-2 предложения)." },
+        ] as Groq.Chat.ChatCompletionContentPart[] }],
         max_tokens: 150,
-      });
+      }), { label: "vision" });
       visionDesc = visionResp.choices[0]?.message?.content?.trim() ?? "";
-    } catch (err) {
-      logger.warn({ err }, "Video frame analysis failed");
-    }
+    } catch (err) { logger.warn({ err }, "Video frame analysis failed"); }
 
     const contextParts: string[] = [];
     if (visionDesc) contextParts.push(`Видео показывает: ${visionDesc}`);
-    if (transcriptText) contextParts.push(`Звук в видео: "${transcriptText}"`);
-    const context = contextParts.length ? contextParts.join(". ") : "Видео без распознанного содержимого.";
+    if (transcriptText) contextParts.push(`Звук: "${transcriptText}"`);
+    const context = contextParts.join(". ") || "Видео без содержимого.";
 
-    const completion = await groq.chat.completions.create({
+    const completion = await withRetry(() => groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      messages: [
-        { role: "system", content: sysPrompt },
-        ...history,
-        { role: "user", content: `[Пользователь отправил видео. ${context}. Ответь как Сэм — живо, в своей манере.]` },
-      ],
-      max_tokens: 512,
-    });
-    return completion.choices[0]?.message?.content?.trim() ?? "хм, интересное видосик)";
+      messages: [{ role: "system", content: sysPrompt }, ...history,
+        { role: "user", content: `[видео: ${context}]` }],
+      max_tokens: 400,
+    }), { label: "video reply" });
+
+    return completion.choices[0]?.message?.content?.trim() ?? "хм, интересный видосик)";
   } finally {
     cleanUp(...filesToClean);
   }
@@ -428,35 +421,33 @@ async function analyzeVideo(userId: number, videoBuffer: Buffer): Promise<string
 
 // ─── Photo analysis ──────────────────────────────────────────────────────────
 
-async function analyzePhoto(userId: number, fileId: string, caption?: string): Promise<string> {
+async function analyzePhoto(userId: number, chatId: number, fileId: string, caption?: string): Promise<string> {
   const fileLink = await bot.getFileLink(fileId);
   const res = await fetch(fileLink);
   const buf = await res.arrayBuffer();
   const base64 = Buffer.from(buf).toString("base64");
   const mime = res.headers.get("content-type") ?? "image/jpeg";
   const memory = await loadMemory(userId);
-  const sysPrompt = SYSTEM_PROMPT_BASE + memory;
-  const history = conversations.get(userId) ?? [];
+  const key = convKey(chatId, userId);
+  const history = conversations.get(key) ?? [];
 
-  const completion = await groq.chat.completions.create({
+  const completion = await withRetry(() => groq.chat.completions.create({
     model: "meta-llama/llama-4-scout-17b-16e-instruct",
     messages: [
-      { role: "system", content: sysPrompt },
+      { role: "system", content: SYSTEM_PROMPT_BASE + memory },
       ...history,
-      {
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } },
-          { type: "text", text: caption ? `Пользователь отправил это с подписью: "${caption}". Ответь как Сэм.` : "Пользователь отправил это фото. Ответь как Сэм — живо, в своей манере." },
-        ] as Groq.Chat.ChatCompletionContentPart[],
-      },
+      { role: "user", content: [
+        { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } },
+        { type: "text", text: caption ? `Пользователь прислал фото с подписью: "${caption}". Ответь как Сэм.` : "Пользователь прислал фото. Ответь как Сэм — живо." },
+      ] as Groq.Chat.ChatCompletionContentPart[] },
     ],
-    max_tokens: 512,
-  });
+    max_tokens: 400,
+  }), { label: "photo analysis" });
+
   return completion.choices[0]?.message?.content?.trim() ?? "хм, интересно)";
 }
 
-// ─── Stickers ────────────────────────────────────────────────────────────────
+// ─── Sticker handling ─────────────────────────────────────────────────────────
 
 async function sendRandomSticker(chatId: number): Promise<boolean> {
   try {
@@ -466,25 +457,19 @@ async function sendRandomSticker(chatId: number): Promise<boolean> {
     if (!pick) return false;
     await bot.sendSticker(chatId, pick.fileId);
     return true;
-  } catch (err) {
-    logger.error({ err }, "Send sticker failed");
-    return false;
-  }
+  } catch { return false; }
 }
 
-async function saveSticker(fileId: string, setName?: string, emoji?: string, category = "general"): Promise<void> {
-  try {
-    await db.insert(botStickersTable)
-      .values({ fileId, setName: setName ?? null, emoji: emoji ?? null, category })
-      .onConflictDoNothing();
-  } catch (err) {
-    logger.error({ err }, "Save sticker failed");
-  }
+async function saveSticker(fileId: string, setName?: string, emoji?: string): Promise<void> {
+  await db.insert(botStickersTable).values({ fileId, setName: setName ?? null, emoji: emoji ?? null })
+    .onConflictDoNothing().catch(() => {});
 }
 
-// ─── Tag parsing ─────────────────────────────────────────────────────────────
+// ─── Tag processing ───────────────────────────────────────────────────────────
 
 async function processTagsAndSend(chatId: number, rawReply: string, asVoice = false): Promise<string> {
+  if (!rawReply?.trim()) return "";
+
   const memeMatch = rawReply.match(/\[МЕМ:([^\]]+)\]/i);
   const photoMatch = rawReply.match(/\[ФОТО:([^\]]+)\]/i);
   const artsMatch = rawReply.match(/\[АРТЫ:([^|]+)\|([^\]]+)\]/i);
@@ -502,55 +487,44 @@ async function processTagsAndSend(chatId: number, rawReply: string, asVoice = fa
   if (memeMatch?.[1]) {
     void (async () => {
       const url = await fetchMeme(memeMatch[1].trim());
-      if (url) { await sleep(1000); await bot.sendPhoto(chatId, url).catch(() => {}); }
+      if (url) { await sleep(1200); await bot.sendPhoto(chatId, url).catch(() => {}); }
     })();
   }
 
   if (photoMatch?.[1]) {
-    void (async () => {
-      await sleep(500);
-      await generateAndSendImage(chatId, photoMatch[1].trim());
-    })();
+    void (async () => { await sleep(500); await generateAndSendImage(chatId, photoMatch[1].trim()); })();
   }
 
   if (artsMatch?.[1] && artsMatch?.[2]) {
-    void (async () => {
-      await sleep(500);
-      await generateArtInStyle(chatId, artsMatch[1].trim(), artsMatch[2].trim());
-    })();
+    void (async () => { await sleep(500); await generateArtInStyle(chatId, artsMatch[1].trim(), artsMatch[2].trim()); })();
   }
 
   if (stickerTag) {
-    void (async () => {
-      await sleep(800);
-      await sendRandomSticker(chatId);
-    })();
+    void (async () => { await sleep(600); await sendRandomSticker(chatId); })();
   }
 
   if (asVoice || voiceTag) {
-    void (async () => {
-      await sleep(1000);
-      await sendVoiceMessage(chatId, clean);
-    })();
+    void (async () => { await sleep(800); await sendVoiceMessage(chatId, clean || rawReply); })();
   }
 
   return clean;
 }
 
-// ─── User tracking ───────────────────────────────────────────────────────────
+// ─── User tracking ────────────────────────────────────────────────────────────
 
 async function trackUser(from: TelegramBot.User): Promise<void> {
-  try {
-    await db.insert(telegramUsersTable)
-      .values({ userId: from.id, username: from.username ?? null, firstName: from.first_name ?? null, lastName: from.last_name ?? null, messageCount: 1 })
-      .onConflictDoUpdate({
-        target: telegramUsersTable.userId,
-        set: { username: from.username ?? null, firstName: from.first_name ?? null, lastName: from.last_name ?? null, messageCount: sql`${telegramUsersTable.messageCount} + 1`, lastSeen: new Date() },
-      });
-  } catch (err) { logger.error({ err }, "Failed to track user"); }
+  await db.insert(telegramUsersTable).values({
+    userId: from.id, username: from.username ?? null,
+    firstName: from.first_name ?? null, lastName: from.last_name ?? null, messageCount: 1,
+  }).onConflictDoUpdate({
+    target: telegramUsersTable.userId,
+    set: { username: from.username ?? null, firstName: from.first_name ?? null,
+      lastName: from.last_name ?? null,
+      messageCount: sql`${telegramUsersTable.messageCount} + 1`, lastSeen: new Date() },
+  }).catch(() => {});
 }
 
-// ─── Memory ──────────────────────────────────────────────────────────────────
+// ─── Memory ───────────────────────────────────────────────────────────────────
 
 async function loadMemory(userId: number): Promise<string> {
   try {
@@ -567,106 +541,175 @@ async function loadMemory(userId: number): Promise<string> {
 
 async function updateMemoryBackground(userId: number, history: ChatMessage[]): Promise<void> {
   try {
-    const recentExchange = history.slice(-6);
-    if (recentExchange.length < 2) return;
+    const recent = history.slice(-6);
+    if (recent.length < 2) return;
     const [existing] = await db.select().from(userMemoryTable).where(eq(userMemoryTable.userId, userId));
-    const currentMemory = existing
+    const curMem = existing
       ? `Текущая память:\nИмя: ${existing.name ?? "—"}\nИнтересы: ${existing.interests ?? "—"}\nСводка: ${existing.summary ?? "—"}\nЗаметки: ${existing.notes ?? "—"}`
       : "Памяти нет.";
-    const prompt = `${currentMemory}\n\nПоследний диалог:\n${recentExchange.map(m => `${m.role === "user" ? "Пользователь" : "Сэм"}: ${m.content}`).join("\n")}\n\nОбнови память. JSON: {"name":"...","interests":"...","summary":"...","notes":"..."}\nПустая строка если нет данных. Макс 200 символов. Не выдумывай.`;
-    const resp = await groq.chat.completions.create({
+    const prompt = `${curMem}\n\nПоследний диалог:\n${recent.map(m => `${m.role === "user" ? "Пользователь" : "Сэм"}: ${m.content}`).join("\n")}\n\nОбнови память. JSON: {"name":"...","interests":"...","summary":"...","notes":"..."}\nПустая строка если нет данных. Макс 200 символов каждое поле. Не выдумывай.`;
+
+    const resp = await withRetry(() => groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages: [{ role: "user", content: prompt }],
       max_tokens: 300,
       response_format: { type: "json_object" },
+    }), { label: "memory update" });
+
+    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? "{}") as Record<string, string>;
+    await db.insert(userMemoryTable).values({
+      userId, name: parsed.name || null, interests: parsed.interests || null,
+      summary: parsed.summary || null, notes: parsed.notes || null, lastUpdated: new Date(),
+    }).onConflictDoUpdate({
+      target: userMemoryTable.userId,
+      set: {
+        name: parsed.name || existing?.name || null,
+        interests: parsed.interests || existing?.interests || null,
+        summary: parsed.summary || existing?.summary || null,
+        notes: parsed.notes || existing?.notes || null,
+        lastUpdated: new Date(),
+      },
     });
-    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? "{}") as { name?: string; interests?: string; summary?: string; notes?: string; };
-    await db.insert(userMemoryTable)
-      .values({ userId, name: parsed.name || null, interests: parsed.interests || null, summary: parsed.summary || null, notes: parsed.notes || null, lastUpdated: new Date() })
-      .onConflictDoUpdate({
-        target: userMemoryTable.userId,
-        set: { name: parsed.name || existing?.name || null, interests: parsed.interests || existing?.interests || null, summary: parsed.summary || existing?.summary || null, notes: parsed.notes || existing?.notes || null, lastUpdated: new Date() },
-      });
   } catch (err) { logger.error({ err }, "Memory update failed"); }
 }
 
-// ─── Proactive messages ──────────────────────────────────────────────────────
+// ─── Proactive follow-ups ─────────────────────────────────────────────────────
 
 async function detectAndScheduleFollowUp(userId: number, userText: string): Promise<void> {
   try {
-    const resp = await groq.chat.completions.create({
+    const resp = await withRetry(() => groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: `Пользователь написал: "${userText}"\nНужно ли написать первым через некоторое время? JSON: {"should_followup":bool,"delay_minutes":число,"topic":"о чём"}\nЕсли нет: {"should_followup":false}\ndelay_minutes 30-300. Только реальные поводы.` }],
+      messages: [{ role: "user", content: `Пользователь написал: "${userText}"\nНужно ли написать первым через некоторое время? JSON: {"should_followup":bool,"delay_minutes":число,"topic":"о чём"}\nЕсли нет: {"should_followup":false}\ndelay_minutes 30-300.` }],
       max_tokens: 100,
       response_format: { type: "json_object" },
-    });
-    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? "{}") as { should_followup?: boolean; delay_minutes?: number; topic?: string; };
+    }), { label: "followup detect" });
+
+    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? "{}") as { should_followup?: boolean; delay_minutes?: number; topic?: string };
     if (!parsed.should_followup || !parsed.delay_minutes || !parsed.topic) return;
-    await db.insert(scheduledMessagesTable).values({ userId, scheduledAt: new Date(Date.now() + parsed.delay_minutes * 60_000), prompt: parsed.topic, status: "pending" });
-    logger.info({ userId, delay: parsed.delay_minutes, topic: parsed.topic }, "Scheduled follow-up");
-  } catch (err) { logger.error({ err }, "Follow-up scheduling failed"); }
+    await db.insert(scheduledMessagesTable).values({
+      userId, scheduledAt: new Date(Date.now() + parsed.delay_minutes * 60_000),
+      prompt: parsed.topic, status: "pending",
+    });
+  } catch { /* Non-critical */ }
 }
 
 async function sendScheduledMessages(): Promise<void> {
   try {
-    const due = await db.select().from(scheduledMessagesTable).where(and(eq(scheduledMessagesTable.status, "pending"), lte(scheduledMessagesTable.scheduledAt, new Date())));
+    const due = await db.select().from(scheduledMessagesTable)
+      .where(and(eq(scheduledMessagesTable.status, "pending"), lte(scheduledMessagesTable.scheduledAt, new Date())));
     for (const msg of due) {
       try {
         await db.update(scheduledMessagesTable).set({ status: "sent" }).where(eq(scheduledMessagesTable.id, msg.id));
         const memory = await loadMemory(msg.userId);
-        const resp = await groq.chat.completions.create({
+        const resp = await withRetry(() => groq.chat.completions.create({
           model: "llama-3.3-70b-versatile",
-          messages: [{ role: "system", content: SYSTEM_PROMPT_BASE + memory }, { role: "user", content: `[Ты пишешь первым. Повод: ${msg.prompt}. Одно короткое живое сообщение — как друг который вспомнил. Без "!"]` }],
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT_BASE + memory },
+            { role: "user", content: `[Ты пишешь первым. Повод: ${msg.prompt}. Короткое живое сообщение как друг. Без "!"]` },
+          ],
           max_tokens: 150,
-        });
-        const text = resp.choices[0]?.message?.content?.trim() ?? null;
+        }), { label: "scheduled msg" });
+        const text = resp.choices[0]?.message?.content?.trim();
         if (text) await sendWithTyping(msg.userId, text);
       } catch (err) {
-        logger.error({ err, msgId: msg.id }, "Failed to send scheduled message");
+        logger.error({ err, msgId: msg.id }, "Scheduled message failed");
         await db.update(scheduledMessagesTable).set({ status: "failed" }).where(eq(scheduledMessagesTable.id, msg.id));
       }
     }
-  } catch (err) { logger.error({ err }, "Scheduled messages check failed"); }
+  } catch { /* Non-critical */ }
 }
 
 setInterval(() => { void sendScheduledMessages(); }, 30_000);
 
-// ─── Main chat (with optional web search enrichment) ─────────────────────────
+// ─── Web search for factual queries ──────────────────────────────────────────
 
-async function chat(userId: number, userText: string): Promise<string> {
+async function webSearch(query: string): Promise<string> {
+  try {
+    const res = await withTimeout(
+      fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`,
+        { headers: { "User-Agent": "SamBot/1.0" } }),
+      8000, "DDG search"
+    );
+    if (!res.ok) return "";
+    const data = await res.json() as { AbstractText?: string; RelatedTopics?: { Text?: string }[] };
+    const parts: string[] = [];
+    if (data.AbstractText) parts.push(data.AbstractText);
+    if (!parts.length && data.RelatedTopics?.length) {
+      parts.push(...data.RelatedTopics.filter(t => t.Text).slice(0, 3).map(t => t.Text ?? ""));
+    }
+    return parts.join(" ").slice(0, 600);
+  } catch { return ""; }
+}
+
+// ─── Music detection ──────────────────────────────────────────────────────────
+
+function isMusicRequest(text: string): string | null {
+  const patterns = [
+    /(?:найди|поищи|скинь|включи|хочу послушать|поставь)\s+(?:песню|трек|музыку|song)?\s*[«"]?(.+?)[»"]?$/i,
+    /(?:песня|трек|song)\s+[«"]?(.+?)[»"]?$/i,
+    /(?:это|ищу)\s+(?:песня|трек|song)\s+[«"]?(.+?)[»"]?/i,
+  ];
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m?.[1] && m[1].length > 3) return m[1].trim();
+  }
+  return null;
+}
+
+// ─── Main chat ────────────────────────────────────────────────────────────────
+
+async function chat(userId: number, chatId: number, userText: string): Promise<string> {
   const memory = await loadMemory(userId);
-  const history = conversations.get(userId) ?? [];
+  const key = convKey(chatId, userId);
+  const history = conversations.get(key) ?? [];
 
-  // Detect if user is asking a factual question and enrich with web search
+  // Music request detection
+  const musicQuery = isMusicRequest(userText);
+  if (musicQuery) {
+    const track = await searchYouTube(musicQuery);
+    if (track) {
+      await sendMusicResult(bot, chatId, track);
+      return "нашёл вот)";
+    }
+  }
+
+  // Factual question → web search enrichment
   let enrichedText = userText;
-  const isQuestion = /[?？]/.test(userText) || /^(кто|что|как|где|когда|почему|зачем|сколько|какой|какая|какое|расскажи|объясни|что такое|что значит)/i.test(userText.trim());
+  const isQuestion = /[?？]/.test(userText) || /^(кто|что|как|где|когда|почему|зачем|сколько|какой|какая|расскажи|объясни|что такое)/i.test(userText.trim());
   if (isQuestion && userText.length > 10) {
     const searchResult = await webSearch(userText);
     if (searchResult) {
-      enrichedText = `${userText}\n\n[СПРАВОЧНАЯ ИНФОРМАЦИЯ для Сэма — используй органично в ответе, не цитируй напрямую: ${searchResult}]`;
+      enrichedText = `${userText}\n\n[СПРАВКА для Сэма — используй органично, не цитируй напрямую: ${searchResult}]`;
     }
   }
 
   history.push({ role: "user", content: userText });
-  const completion = await groq.chat.completions.create({
-    model: "llama-3.3-70b-versatile",
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT_BASE + memory },
-      ...history.slice(0, -1),
-      { role: "user", content: enrichedText },
-    ],
-    max_tokens: 512,
-  });
+
+  const completion = await withRetry(() => withTimeout(
+    groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT_BASE + memory },
+        ...history.slice(0, -1),
+        { role: "user", content: enrichedText },
+      ],
+      max_tokens: 512,
+    }),
+    30000, "chat"
+  ), { label: "chat" });
+
   const rawReply = completion.choices[0]?.message?.content?.trim() ?? "извини, что-то пошло не так";
-  const clean = await processTagsAndSend(userId, rawReply);
-  history.push({ role: "assistant", content: clean });
+  const clean = await processTagsAndSend(chatId, rawReply);
+  const finalText = clean || rawReply.replace(/\[.*?\]/g, "").trim() || "...";
+
+  history.push({ role: "assistant", content: finalText });
   if (history.length > 30) history.splice(0, 2);
-  conversations.set(userId, history);
+  conversations.set(key, history);
   void updateMemoryBackground(userId, history);
-  return clean;
+  return finalText;
 }
 
-// ─── Stats ───────────────────────────────────────────────────────────────────
+// ─── Stats ────────────────────────────────────────────────────────────────────
 
 async function getStats(): Promise<string> {
   const now = new Date();
@@ -681,121 +724,511 @@ async function getStats(): Promise<string> {
   const [pending] = await db.select({ count: count() }).from(scheduledMessagesTable).where(eq(scheduledMessagesTable.status, "pending"));
   const [stickerCount] = await db.select({ count: count() }).from(botStickersTable);
 
-  // Get unique sticker packs
-  const stickerPacks = await db
-    .selectDistinct({ setName: botStickersTable.setName })
-    .from(botStickersTable)
-    .where(sql`${botStickersTable.setName} IS NOT NULL`);
+  const stickerPacks = await db.selectDistinct({ setName: botStickersTable.setName })
+    .from(botStickersTable).where(sql`${botStickersTable.setName} IS NOT NULL`);
 
-  const topUsers = await db
-    .select({ firstName: telegramUsersTable.firstName, username: telegramUsersTable.username, messageCount: telegramUsersTable.messageCount })
-    .from(telegramUsersTable)
-    .orderBy(sql`${telegramUsersTable.messageCount} desc`)
-    .limit(5);
+  const topUsers = await db.select({
+    firstName: telegramUsersTable.firstName,
+    username: telegramUsersTable.username,
+    messageCount: telegramUsersTable.messageCount,
+  }).from(telegramUsersTable).orderBy(sql`${telegramUsersTable.messageCount} desc`).limit(5);
 
   const topList = topUsers.map((u, i) =>
     `${i + 1}. ${u.username ? `@${u.username}` : (u.firstName ?? "—")} — ${u.messageCount} сообщ.`
   ).join("\n");
 
-  const packsCount = stickerPacks.length;
-  const packNames = stickerPacks
-    .filter(p => p.setName)
-    .map(p => `• ${p.setName}`)
+  const packLinks = stickerPacks.filter(p => p.setName)
+    .map(p => `• <a href="https://t.me/addstickers/${p.setName}">${p.setName}</a>`)
     .join("\n");
 
   return [
     `📊 <b>Статистика бота</b>`, ``,
-    `👥 Всего пользователей: <b>${totalRow?.total ?? 0}</b>`,
-    `💬 Всего сообщений: <b>${totalRow?.totalMessages ?? 0}</b>`, ``,
-    `🟢 Активны за 24ч: <b>${activeDay?.count ?? 0}</b>`,
-    `📅 Активны за неделю: <b>${activeWeek?.count ?? 0}</b>`,
+    `👥 Пользователей: <b>${totalRow?.total ?? 0}</b>`,
+    `💬 Сообщений: <b>${totalRow?.totalMessages ?? 0}</b>`, ``,
+    `🟢 Актив 24ч: <b>${activeDay?.count ?? 0}</b>`,
+    `📅 Актив неделя: <b>${activeWeek?.count ?? 0}</b>`,
     `✨ Новых сегодня: <b>${newToday?.count ?? 0}</b>`,
     `⏰ Запланировано: <b>${pending?.count ?? 0}</b>`, ``,
-    `🎭 Стикеров в библиотеке: <b>${stickerCount?.count ?? 0}</b>`,
-    `📦 Паков стикеров: <b>${packsCount}</b>`,
-    ...(packNames ? [`\n<b>Известные паки:</b>\n${packNames}`] : []),
+    `🎭 Стикеров: <b>${stickerCount?.count ?? 0}</b>`,
+    stickerPacks.length > 0 ? `📦 Паки стикеров (${stickerPacks.length}):\n${packLinks}` : "",
     ``,
     `🏆 <b>Топ-5:</b>`,
     topList || "пока никого нет",
     ``,
-    `🎨 <b>Стили арта:</b> nixeu, wlop, loish, ghibli, wlop, artgerm, sakimichan, manga, cyberpunk и др.`,
-    `🔊 <b>Голос:</b> ElevenLabs ${eleven ? "✅" : "❌"}`,
-  ].join("\n");
+    `🔊 ElevenLabs: ${eleven ? "✅" : "❌"}`,
+  ].filter(l => l !== "").join("\n");
 }
 
-// ─── Commands ────────────────────────────────────────────────────────────────
+// ─── /skills command ──────────────────────────────────────────────────────────
 
-bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-  conversations.delete(chatId);
-  if (msg.from) await trackUser(msg.from);
-  const firstName = msg.from?.first_name ?? "дружище";
-  const memory = await loadMemory(chatId);
-  if (memory.length > 0) {
-    const resp = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [{ role: "system", content: SYSTEM_PROMPT_BASE + memory }, { role: "user", content: `[Пользователь вернулся. Тёплое живое приветствие — как старый друг. Коротко, без "!"]` }],
-      max_tokens: 150,
+const SKILLS_PAGES: Record<string, { title: string; text: string }> = {
+  chat: {
+    title: "💬 Общение",
+    text: `<b>💬 Общение</b>\n\nСэм общается как живой друг-ровесник. Зеркалит твой стиль речи, темп, эмодзи.\n\n• Обычный чат — просто пиши\n• Ролевые игры — входит в роль полностью\n• Отвечает на вопросы (использует поиск для фактов)\n• Помнит тебя между сессиями (имя, интересы, детали)\n• Сам пишет первым если был повод`,
+  },
+  media: {
+    title: "🎨 Медиа",
+    text: `<b>🎨 Медиа-возможности</b>\n\n🎵 <b>Музыка</b> — "найди песню [название]"\n🖼 <b>Фото/картинка</b> — "скинь фото [что]"\n🎨 <b>Арт в стиле художника</b> — "нарисуй в стиле nixeu [что]"\n   Стили: nixeu, wlop, loish, ghibli, artgerm, manga, cyberpunk и др.\n😂 <b>Мем</b> — "скинь мем про [тему]"\n🔊 <b>Голосовое</b> — "ответь голосом"\n\nАнализирует фото, видео, кружки — просто отправь`,
+  },
+  group: {
+    title: "👥 Группа",
+    text: `<b>👥 Администрирование групп</b>\n\n📋 <code>/rules</code> — правила\n📋 <code>/setrules [текст]</code> — установить правила\n👋 <code>/setwelcome [текст]</code> — приветствие ({name})\n📊 <code>/chatstats</code> — статистика чата\n📝 <code>/cmds</code> — кастомные команды\n<code>/addcmd !триггер ответ</code> — добавить команду\n<code>/delcmd !триггер</code> — удалить\n\n⚠️ Модерация:\n<code>/ban</code> <code>/unban</code> <code>/mute [мин]</code> <code>/unmute</code>\n<code>/warn [причина]</code> <code>/warns</code> <code>/unwarn</code>\n<code>/moderation on/off</code> <code>/autoban on/off</code>`,
+  },
+  games: {
+    title: "🎮 Игры",
+    text: `<b>🎮 Игры в чатах</b>\n\n⚔️ <b>Дуэль</b>\n<code>/duel @username</code> — вызов на дуэль\nПринять/отказать кнопками\n\n💍 <b>Брак</b>\n<code>/marry @username</code> — предложить\n<code>/divorce</code> — развестись\n<code>/marriage</code> — статус\n\n🎭 <b>Мафия</b>\n<code>/mafia</code> — создать игру (мин. 4 игрока)\n<code>/mafiaend</code> — завершить\nРоли: Мафия, Шериф, Доктор, Мирный`,
+  },
+  admin_tools: {
+    title: "🔧 Инструменты",
+    text: `<b>🔧 Дополнительные команды</b>\n\n<code>/stat</code> — статистика бота (только личка)\n<code>/help</code> — помощь\n<code>/clear</code> — очистить историю\n<code>/export_data</code> — скачать свои данные (GDPR)\n\n📢 <b>Рассылка (только владелец)</b>\n<code>/broadcast</code> — рассылка по всем чатам\n\n📊 <b>Аналитика (только владелец)</b>\n<code>/danni @user</code> — профиль\n<code>/danni_chat</code> — аналитика чата\n\n🤖 Сэм следит за порядком в чате: анти-флуд, конфликты, спам`,
+  },
+};
+
+async function sendSkillsMenu(chatId: number, messageId?: number): Promise<void> {
+  const keyboard: TelegramBot.InlineKeyboardButton[][] = [
+    [
+      { text: "💬 Общение", callback_data: "skills:chat" },
+      { text: "🎨 Медиа", callback_data: "skills:media" },
+    ],
+    [
+      { text: "👥 Группа", callback_data: "skills:group" },
+      { text: "🎮 Игры", callback_data: "skills:games" },
+    ],
+    [
+      { text: "🔧 Инструменты", callback_data: "skills:admin_tools" },
+    ],
+  ];
+
+  const text = `🤖 <b>Сэм — все навыки</b>\n\nВыбери раздел чтобы узнать подробнее:`;
+
+  if (messageId) {
+    await bot.editMessageText(text, {
+      chat_id: chatId, message_id: messageId, parse_mode: "HTML",
+      reply_markup: { inline_keyboard: keyboard },
+    }).catch(() => {});
+  } else {
+    await bot.sendMessage(chatId, text, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: keyboard },
     });
+  }
+}
+
+// ─── Moderation: auto-detect conflict & spam ──────────────────────────────────
+
+async function runAutoModeration(msg: TelegramBot.Message): Promise<boolean> {
+  const chatId = msg.chat.id;
+  const from = msg.from;
+  const text = msg.text ?? "";
+  if (!from || !text) return false;
+
+  const isGroupChat = msg.chat.type === "group" || msg.chat.type === "supergroup";
+  if (!isGroupChat) return false;
+
+  // Load moderation config
+  const [config] = await db.select().from(moderationConfigTable).where(eq(moderationConfigTable.groupId, chatId)).catch(() => []);
+  if (config && !config.moderationEnabled) return false;
+
+  const threshold = config?.floodThreshold ?? 5;
+  const sensitivity = config?.conflictSensitivity ?? "medium";
+
+  // Flood check
+  const { isFlood } = checkFlood(chatId, from.id, { threshold, windowMs: 10_000 });
+  if (isFlood) {
+    try {
+      await bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+      await bot.restrictChatMember(chatId, from.id, {
+        permissions: { can_send_messages: false },
+        until_date: Math.floor(Date.now() / 1000) + 5 * 60,
+      });
+      await bot.sendMessage(chatId, `🔇 @${from.username ?? from.first_name} замучен на 5 минут за флуд.`);
+      return true;
+    } catch { /* Insufficient permissions */ }
+  }
+
+  // Spam check
+  if (isSpam(text)) {
+    try {
+      await bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+      await bot.sendMessage(chatId, `🚫 Спам удалён.`);
+      return true;
+    } catch { /* Ignore */ }
+  }
+
+  // Conflict detection
+  const history = chatMsgHistory.get(chatId) ?? [];
+  recordForConflict(chatId, from.id, text);
+  const updated = chatMsgHistory.get(chatId) ?? [];
+
+  if (updated.length >= 5 && sensitivity !== "low") {
+    const minSent = sensitivity === "high" ? -0.5 : -0.7;
+    const { isConflict, aggressorId } = detectConflictContext(updated);
+    if (isConflict && aggressorId) {
+      const doAutoban = config?.autobanEnabled ?? false;
+      try {
+        if (doAutoban) {
+          await bot.banChatMember(chatId, aggressorId);
+          await bot.sendMessage(chatId, `⚠️ Конфликт выявлен — агрессор забанен автоматически.`);
+        } else {
+          await bot.restrictChatMember(chatId, aggressorId, {
+            permissions: { can_send_messages: false },
+            until_date: Math.floor(Date.now() / 1000) + 30 * 60,
+          });
+          await bot.sendMessage(chatId, `⚠️ Замечена эскалация конфликта. Участник замучен на 30 минут.`);
+        }
+        chatMsgHistory.delete(chatId);
+        return true;
+      } catch { /* Insufficient permissions */ }
+      void minSent;
+    }
+  }
+
+  return false;
+}
+
+// ─── Callback query handler ───────────────────────────────────────────────────
+
+bot.on("callback_query", async (query) => {
+  const data = query.data ?? "";
+  const chatId = query.message?.chat.id;
+  const msgId = query.message?.message_id;
+
+  try {
+    // Skills menu
+    if (data.startsWith("skills:")) {
+      const page = data.split(":")[1] as string;
+      const content = SKILLS_PAGES[page];
+      if (content && chatId && msgId) {
+        await bot.answerCallbackQuery(query.id);
+        await bot.editMessageText(content.text, {
+          chat_id: chatId, message_id: msgId, parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "◀️ Назад", callback_data: "skills:menu" },
+            ]],
+          },
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    if (data === "skills:menu") {
+      await bot.answerCallbackQuery(query.id);
+      if (chatId && msgId) await sendSkillsMenu(chatId, msgId);
+      return;
+    }
+
+    // Voice text button
+    if (data.startsWith("voice_text:")) {
+      const encoded = data.replace("voice_text:", "");
+      try {
+        const text = Buffer.from(encoded, "base64").toString("utf-8");
+        await bot.answerCallbackQuery(query.id, { text: "Вот текст:" });
+        if (chatId) await bot.sendMessage(chatId, text, { reply_to_message_id: msgId });
+      } catch {
+        await bot.answerCallbackQuery(query.id, { text: "Не смог декодировать" });
+      }
+      return;
+    }
+
+    // Lyrics
+    if (data.startsWith("lyrics:")) {
+      await handleLyricsCallback(bot, query);
+      return;
+    }
+
+    // Duel
+    if (data.startsWith("duel_")) {
+      await handleDuelCallback(bot, query);
+      return;
+    }
+
+    // Marriage
+    if (data.startsWith("marry_")) {
+      await handleMarryCallback(bot, query);
+      return;
+    }
+
+    // Mafia
+    if (data.startsWith("mafia_")) {
+      await handleMafiaCallback(bot, query);
+      return;
+    }
+
+    // Broadcast
+    if (data.startsWith("broadcast_")) {
+      await handleBroadcastModeCallback(bot, query);
+      return;
+    }
+
+    // /danni callbacks
+    if (data.startsWith("danni_")) {
+      if (!isOwner(query.from.id)) { await bot.answerCallbackQuery(query.id, { text: "Нет прав" }); return; }
+      const [, action, userIdStr] = data.split(":");
+      if (action === "delete" && userIdStr && chatId) {
+        await db.delete(userMemoryTable).where(eq(userMemoryTable.userId, parseInt(userIdStr))).catch(() => {});
+        await bot.answerCallbackQuery(query.id, { text: "Данные удалены" });
+        await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+      } else {
+        await bot.answerCallbackQuery(query.id);
+      }
+      return;
+    }
+
+    // Moderation inline confirmations
+    if (data.startsWith("mod_")) {
+      await bot.answerCallbackQuery(query.id);
+      return;
+    }
+
+    await bot.answerCallbackQuery(query.id);
+  } catch (err) {
+    logger.error({ err }, "Callback query error");
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+  }
+});
+
+// ─── Commands ─────────────────────────────────────────────────────────────────
+
+bot.onText(/^\/start/, async (msg) => {
+  const chatId = msg.chat.id;
+  const from = msg.from;
+  conversations.delete(convKey(chatId, from?.id ?? chatId));
+  if (from) await trackUser(from);
+  await trackBotChat(bot, msg);
+
+  const firstName = from?.first_name ?? "дружище";
+  const memory = await loadMemory(from?.id ?? chatId);
+
+  if (memory.length > 0) {
+    const resp = await withRetry(() => groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [{ role: "system", content: SYSTEM_PROMPT_BASE + memory },
+        { role: "user", content: `[Пользователь вернулся. Тёплое приветствие как старый друг. Коротко, без "!"]` }],
+      max_tokens: 150,
+    }), { label: "/start return" });
     const greeting = resp.choices[0]?.message?.content?.trim();
     if (greeting) { await sendWithTyping(chatId, greeting); return; }
   }
-  await sendWithTyping(chatId, `о, привет ${firstName}) я сэм, мне 20, можем просто поговорить — ни о чём или обо всём сразу\n\nпиши что хочешь, я тут`);
+  await sendWithTyping(chatId, `о, привет ${firstName}) я сэм, мне 20, можем просто поговорить — ни о чём или обо всём\n\nпиши что хочешь, я тут`);
 });
 
-bot.onText(/\/help/, (msg) => {
-  void bot.sendMessage(msg.chat.id, `ничего особого\n/start — начать сначала\n/clear — стереть историю\n/stat — статистика\n\nможешь скидывать стикеры — запомню их)\nмогу рисовать в стилях: nixeu, wlop, loish, ghibli, artgerm, manga, cyberpunk...`);
+bot.onText(/^\/help/, async (msg) => {
+  await bot.sendMessage(msg.chat.id, `используй /skills — там всё`, { reply_to_message_id: msg.message_id });
 });
 
-bot.onText(/\/clear/, async (msg) => {
+bot.onText(/^\/skills/, async (msg) => {
+  await trackBotChat(bot, msg);
+  await sendSkillsMenu(msg.chat.id);
+});
+
+bot.onText(/^\/clear/, async (msg) => {
   const chatId = msg.chat.id;
-  conversations.delete(chatId);
-  await db.delete(userMemoryTable).where(eq(userMemoryTable.userId, chatId));
-  void bot.sendMessage(chatId, "всё, чистый лист. как будто не было ничего)");
+  const userId = msg.from?.id ?? chatId;
+  conversations.delete(convKey(chatId, userId));
+  await db.delete(userMemoryTable).where(eq(userMemoryTable.userId, userId)).catch(() => {});
+  await bot.sendMessage(chatId, "всё, чистый лист)", { reply_to_message_id: msg.message_id });
 });
 
-bot.onText(/\/stat/, async (msg) => {
-  try { await bot.sendMessage(msg.chat.id, await getStats(), { parse_mode: "HTML" }); }
-  catch (err) { logger.error({ err }, "Stats error"); void bot.sendMessage(msg.chat.id, "что-то пошло не так со статистикой"); }
+bot.onText(/^\/stat/, async (msg) => {
+  if (msg.chat.type !== "private") {
+    await bot.sendMessage(msg.chat.id, "статистика только в личке");
+    return;
+  }
+  try {
+    await bot.sendMessage(msg.chat.id, await getStats(), { parse_mode: "HTML" });
+  } catch (err) {
+    logger.error({ err }, "Stats error");
+    await bot.sendMessage(msg.chat.id, "ошибка получения статистики");
+  }
 });
 
-// ─── Sticker handler ─────────────────────────────────────────────────────────
+// /status — bot health (owner only)
+bot.onText(/^\/status/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const mem = process.memoryUsage();
+  const uptime = Math.floor(process.uptime());
+  const h = Math.floor(uptime / 3600);
+  const m = Math.floor((uptime % 3600) / 60);
+  const text = [
+    `🤖 <b>Статус бота</b>`,
+    `⏱ Аптайм: ${h}ч ${m}м`,
+    `💾 RAM: ${Math.round(mem.heapUsed / 1024 / 1024)}МБ / ${Math.round(mem.heapTotal / 1024 / 1024)}МБ`,
+    `🔊 ElevenLabs: ${eleven ? "✅" : "❌"}`,
+    `🧠 Groq: ✅`,
+    `🗃 DB: ✅`,
+  ].join("\n");
+  await bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
+});
+
+// /danni
+bot.onText(/^\/danni(?:_chat)?(\s+.*)?$/, async (msg, match) => {
+  if (!isOwner(msg.from?.id ?? 0)) {
+    await bot.sendMessage(msg.chat.id, "только для владельца", { reply_to_message_id: msg.message_id });
+    return;
+  }
+  if (msg.text?.startsWith("/danni_chat")) {
+    await handleDanniChat(bot, msg);
+    return;
+  }
+  const target = extractUserFromText(msg.text ?? "", msg) ?? (msg.reply_to_message?.from ?? null);
+  await handleDanniUser(bot, msg, target as TelegramBot.User | null);
+  void match;
+});
+
+// /export_data
+bot.onText(/^\/export_data/, async (msg) => {
+  await handleExportData(bot, msg);
+});
+
+// /broadcast
+bot.onText(/^\/broadcast/, async (msg) => {
+  await handleBroadcastCommand(bot, msg);
+});
+
+// Group admin commands
+bot.onText(/^\/rules/, async (msg) => { await handleRules(bot, msg); });
+bot.onText(/^\/setrules\s*(.+)?/, async (msg, m) => { await handleSetRules(bot, msg, m?.[1] ?? ""); });
+bot.onText(/^\/setwelcome\s*(.+)?/, async (msg, m) => { await handleSetWelcome(bot, msg, m?.[1] ?? ""); });
+bot.onText(/^\/chatstats/, async (msg) => { await handleGroupStats(bot, msg); });
+bot.onText(/^\/cmds/, async (msg) => { await handleListCmds(bot, msg); });
+
+bot.onText(/^\/addcmd\s+(\S+)\s+(.+)/, async (msg, m) => {
+  await handleAddCmd(bot, msg, m?.[1] ?? "", m?.[2] ?? "");
+});
+bot.onText(/^\/delcmd\s+(\S+)/, async (msg, m) => {
+  await handleDelCmd(bot, msg, m?.[1] ?? "");
+});
+
+bot.onText(/^\/ban/, async (msg) => {
+  const target = extractUserFromText(msg.text ?? "", msg);
+  await handleBan(bot, msg, target);
+});
+bot.onText(/^\/unban/, async (msg) => {
+  const target = extractUserFromText(msg.text ?? "", msg);
+  await handleUnban(bot, msg, target);
+});
+bot.onText(/^\/mute(?:\s+(\d+))?/, async (msg, m) => {
+  const target = extractUserFromText(msg.text ?? "", msg);
+  await handleMute(bot, msg, target, parseInt(m?.[1] ?? "60"));
+});
+bot.onText(/^\/unmute/, async (msg) => {
+  const target = extractUserFromText(msg.text ?? "", msg);
+  await handleUnmute(bot, msg, target);
+});
+bot.onText(/^\/warn(?:\s+(.+))?/, async (msg, m) => {
+  const target = extractUserFromText(msg.text ?? "", msg);
+  await handleWarn(bot, msg, target, m?.[1]);
+});
+bot.onText(/^\/warns/, async (msg) => {
+  const target = extractUserFromText(msg.text ?? "", msg);
+  await handleWarns(bot, msg, target);
+});
+bot.onText(/^\/unwarn/, async (msg) => {
+  const target = extractUserFromText(msg.text ?? "", msg);
+  await handleUnwarn(bot, msg, target);
+});
+
+// Moderation config
+bot.onText(/^\/moderation\s+(on|off)/, async (msg, m) => {
+  if (!msg.from) return;
+  const enabled = m?.[1] === "on";
+  await db.insert(moderationConfigTable).values({ groupId: msg.chat.id, moderationEnabled: enabled })
+    .onConflictDoUpdate({ target: moderationConfigTable.groupId, set: { moderationEnabled: enabled, updatedAt: new Date() } }).catch(() => {});
+  await bot.sendMessage(msg.chat.id, `Авто-модерация: ${enabled ? "✅ включена" : "❌ выключена"}`, { reply_to_message_id: msg.message_id });
+});
+
+bot.onText(/^\/autoban\s+(on|off)/, async (msg, m) => {
+  if (!msg.from) return;
+  const enabled = m?.[1] === "on";
+  await db.insert(moderationConfigTable).values({ groupId: msg.chat.id, autobanEnabled: enabled })
+    .onConflictDoUpdate({ target: moderationConfigTable.groupId, set: { autobanEnabled: enabled, updatedAt: new Date() } }).catch(() => {});
+  await bot.sendMessage(msg.chat.id, `Авто-бан: ${enabled ? "✅ включён" : "❌ выключен"}`, { reply_to_message_id: msg.message_id });
+});
+
+bot.onText(/^\/conflict_sensitivity\s+(low|medium|high)/, async (msg, m) => {
+  const val = m?.[1] ?? "medium";
+  await db.insert(moderationConfigTable).values({ groupId: msg.chat.id, conflictSensitivity: val })
+    .onConflictDoUpdate({ target: moderationConfigTable.groupId, set: { conflictSensitivity: val, updatedAt: new Date() } }).catch(() => {});
+  await bot.sendMessage(msg.chat.id, `Чувствительность конфликтов: <b>${val}</b>`, { parse_mode: "HTML", reply_to_message_id: msg.message_id });
+});
+
+// Group custom rules (owner/admin)
+bot.onText(/^\/setrule\s+(.+)/, async (msg, m) => {
+  const chatId = msg.chat.id;
+  if (!m?.[1]) return;
+  const [existing] = await db.select().from(groupSettingsTable).where(eq(groupSettingsTable.groupId, chatId)).catch(() => []);
+  const current = existing?.rules ?? "";
+  const newRules = current ? `${current}\n• ${m[1]}` : `• ${m[1]}`;
+  await db.insert(groupSettingsTable).values({ groupId: chatId, rules: newRules })
+    .onConflictDoUpdate({ target: groupSettingsTable.groupId, set: { rules: newRules, updatedAt: new Date() } }).catch(() => {});
+  await bot.sendMessage(chatId, `✅ Правило добавлено.`, { reply_to_message_id: msg.message_id });
+});
+
+bot.onText(/^\/ruleslist/, async (msg) => { await handleRules(bot, msg); });
+
+// Game commands
+bot.onText(/^\/duel/, async (msg) => {
+  const target = extractUserFromText(msg.text ?? "", msg);
+  await handleDuel(bot, msg, target);
+});
+bot.onText(/^\/marry/, async (msg) => {
+  const target = extractUserFromText(msg.text ?? "", msg);
+  await handleMarry(bot, msg, target);
+});
+bot.onText(/^\/divorce/, async (msg) => { await handleDivorce(bot, msg); });
+bot.onText(/^\/marriage/, async (msg) => { await handleMarriageStatus(bot, msg); });
+bot.onText(/^\/mafia/, async (msg) => {
+  if (!msg.text?.startsWith("/mafiaend")) await handleMafia(bot, msg);
+});
+bot.onText(/^\/mafiaend/, async (msg) => { await handleMafiaEnd(bot, msg); });
+
+// ─── New member handler ───────────────────────────────────────────────────────
+
+bot.on("new_chat_members", async (msg) => {
+  await handleNewMember(bot, msg);
+  await trackBotChat(bot, msg);
+});
+
+// ─── Sticker handler ──────────────────────────────────────────────────────────
 
 bot.on("sticker", async (msg) => {
   const chatId = msg.chat.id;
   const sticker = msg.sticker;
-  if (!sticker) return;
-  if (msg.from) await trackUser(msg.from);
+  if (!sticker || !msg.from) return;
+  if (msg.from.is_bot) return;
+  await trackUser(msg.from);
+  await trackBotChat(bot, msg);
+  await saveSticker(sticker.file_id, sticker.set_name, sticker.emoji);
 
-  const category = sticker.set_name
-    ? (sticker.set_name.toLowerCase().includes("anime") || sticker.set_name.toLowerCase().includes("kpop") ? sticker.set_name : "general")
-    : "general";
-  await saveSticker(sticker.file_id, sticker.set_name, sticker.emoji, category);
+  const memory = await loadMemory(msg.from.id);
+  const key = convKey(chatId, msg.from.id);
+  const history = conversations.get(key) ?? [];
 
-  const memory = await loadMemory(chatId);
-  const history = conversations.get(chatId) ?? [];
-  const resp = await groq.chat.completions.create({
+  const resp = await withRetry(() => groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: [
       { role: "system", content: SYSTEM_PROMPT_BASE + memory },
       ...history,
-      { role: "user", content: `[Пользователь прислал стикер с эмодзи: ${sticker.emoji ?? "?"}${sticker.set_name ? `, из набора "${sticker.set_name}"` : ""}. Короткая живая реакция как Сэм. Без "!"]` },
+      { role: "user", content: `[стикер ${sticker.emoji ?? ""}${sticker.set_name ? ` из набора "${sticker.set_name}"` : ""}]` },
     ],
-    max_tokens: 100,
-  });
+    max_tokens: 80,
+  }), { label: "sticker reply" });
+
   const reply = resp.choices[0]?.message?.content?.trim() ?? "хах)";
   history.push({ role: "user", content: `[стикер ${sticker.emoji ?? ""}]` });
   history.push({ role: "assistant", content: reply });
-  conversations.set(chatId, history);
-  await sendWithTyping(chatId, reply);
+  conversations.set(key, history);
+  if (reply) await sendWithTyping(chatId, reply);
 });
 
-// ─── Voice handler ───────────────────────────────────────────────────────────
+// ─── Voice handler ────────────────────────────────────────────────────────────
 
 bot.on("voice", async (msg) => {
   const chatId = msg.chat.id;
-  if (!msg.voice) return;
-  if (msg.from) await trackUser(msg.from);
+  if (!msg.voice || !msg.from || msg.from.is_bot) return;
+  await trackUser(msg.from);
+  await trackBotChat(bot, msg);
 
   try {
     await bot.sendChatAction(chatId, "typing");
@@ -809,51 +1242,61 @@ bot.on("voice", async (msg) => {
       return;
     }
 
-    logger.info({ chatId, transcribed }, "Voice transcribed");
-    const reply = await chat(chatId, `[голосовое]: ${transcribed}`);
-    await sendWithTyping(chatId, reply);
+    const reply = await chat(msg.from.id, chatId, `[голосовое]: ${transcribed}`);
+    await sendWithTyping(chatId, reply, {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "🔊 Ответить голосом", callback_data: `voice_reply:${Buffer.from(reply.slice(0, 200)).toString("base64")}` },
+        ]],
+      },
+    });
     void sendVoiceMessage(chatId, reply);
   } catch (err) {
     logger.error({ err }, "Voice handling failed");
-    await bot.sendMessage(chatId, "не смог распознать голосовое, попробуй ещё раз");
+    await bot.sendMessage(chatId, "не смог распознать, попробуй ещё раз");
   }
 });
 
-// ─── Photo handler ───────────────────────────────────────────────────────────
+// ─── Photo handler ────────────────────────────────────────────────────────────
 
 bot.on("photo", async (msg) => {
   const chatId = msg.chat.id;
-  if (msg.from) await trackUser(msg.from);
-  const photos = msg.photo;
-  if (!photos?.length) return;
-  const largest = photos[photos.length - 1];
+  if (!msg.from || msg.from.is_bot) return;
+  await trackUser(msg.from);
+  await trackBotChat(bot, msg);
+  const largest = msg.photo?.[msg.photo.length - 1];
   if (!largest) return;
+
   try {
     await bot.sendChatAction(chatId, "typing");
-    const reply = await analyzePhoto(chatId, largest.file_id, msg.caption);
+    const reply = await analyzePhoto(msg.from.id, chatId, largest.file_id, msg.caption);
     const clean = await processTagsAndSend(chatId, reply);
-    const history = conversations.get(chatId) ?? [];
+    const finalText = clean || reply.replace(/\[.*?\]/g, "").trim();
+    if (!finalText) return;
+    const key = convKey(chatId, msg.from.id);
+    const history = conversations.get(key) ?? [];
     history.push({ role: "user", content: `[фото${msg.caption ? `: "${msg.caption}"` : ""}]` });
-    history.push({ role: "assistant", content: clean });
+    history.push({ role: "assistant", content: finalText });
     if (history.length > 30) history.splice(0, 2);
-    conversations.set(chatId, history);
-    void updateMemoryBackground(chatId, history);
-    await sendWithTyping(chatId, clean);
+    conversations.set(key, history);
+    void updateMemoryBackground(msg.from.id, history);
+    await sendWithTyping(chatId, finalText);
   } catch (err) {
     logger.error({ err }, "Photo analysis failed");
     await bot.sendMessage(chatId, "хм, не смог рассмотреть нормально");
   }
 });
 
-// ─── Video handler ───────────────────────────────────────────────────────────
+// ─── Video handler ────────────────────────────────────────────────────────────
 
 bot.on("video", async (msg) => {
   const chatId = msg.chat.id;
-  if (!msg.video) return;
-  if (msg.from) await trackUser(msg.from);
+  if (!msg.video || !msg.from || msg.from.is_bot) return;
+  await trackUser(msg.from);
+  await trackBotChat(bot, msg);
 
   if (msg.video.file_size && msg.video.file_size > 45 * 1024 * 1024) {
-    await bot.sendMessage(chatId, "видос слишком большой, скинь что-нибудь до 45мб");
+    await bot.sendMessage(chatId, "видос слишком большой, до 45мб пожалуйста");
     return;
   }
 
@@ -862,61 +1305,90 @@ bot.on("video", async (msg) => {
     const fileLink = await bot.getFileLink(msg.video.file_id);
     const res = await fetch(fileLink);
     const buf = Buffer.from(await res.arrayBuffer());
-    const reply = await analyzeVideo(chatId, buf);
+    const reply = await analyzeVideo(msg.from.id, chatId, buf);
     const clean = await processTagsAndSend(chatId, reply);
-    const history = conversations.get(chatId) ?? [];
-    history.push({ role: "user", content: "[видео]" });
-    history.push({ role: "assistant", content: clean });
-    if (history.length > 30) history.splice(0, 2);
-    conversations.set(chatId, history);
-    void updateMemoryBackground(chatId, history);
-    await sendWithTyping(chatId, clean);
+    const finalText = clean || reply.replace(/\[.*?\]/g, "").trim();
+    if (finalText) await sendWithTyping(chatId, finalText);
   } catch (err) {
     logger.error({ err }, "Video analysis failed");
-    await bot.sendMessage(chatId, "не смог посмотреть видос нормально, попробуй другое");
+    await bot.sendMessage(chatId, "не смог посмотреть видос нормально");
   }
 });
 
-// ─── Video note (circles) ────────────────────────────────────────────────────
+// ─── Video note handler ───────────────────────────────────────────────────────
 
 bot.on("video_note", async (msg) => {
   const chatId = msg.chat.id;
-  if (!msg.video_note) return;
-  if (msg.from) await trackUser(msg.from);
+  if (!msg.video_note || !msg.from || msg.from.is_bot) return;
+  await trackUser(msg.from);
   try {
     await bot.sendChatAction(chatId, "typing");
     const fileLink = await bot.getFileLink(msg.video_note.file_id);
     const res = await fetch(fileLink);
     const buf = Buffer.from(await res.arrayBuffer());
-    const reply = await analyzeVideo(chatId, buf);
+    const reply = await analyzeVideo(msg.from.id, chatId, buf);
     const clean = await processTagsAndSend(chatId, reply);
-    await sendWithTyping(chatId, clean);
+    const finalText = clean || reply.replace(/\[.*?\]/g, "").trim();
+    if (finalText) await sendWithTyping(chatId, finalText);
   } catch (err) {
     logger.error({ err }, "Video note failed");
     await bot.sendMessage(chatId, "кружок не смог посмотреть, попробуй заново");
   }
 });
 
-// ─── Message handler ─────────────────────────────────────────────────────────
+// ─── Main message handler ─────────────────────────────────────────────────────
 
 bot.on("message", async (msg) => {
-  if (msg.text?.startsWith("/")) return;
-  if (!msg.text) return;
+  if (!msg.text || msg.text.startsWith("/")) return;
   if (msg.photo || msg.video || msg.video_note || msg.sticker || msg.voice) return;
+  if (!msg.from || msg.from.is_bot) return;
 
   const chatId = msg.chat.id;
-  if (msg.from) await trackUser(msg.from);
+  const from = msg.from;
+  const text = msg.text;
+
+  await trackUser(from);
+  await trackBotChat(bot, msg);
+
+  // Log for analytics
+  logMessage(chatId, from.id, from.username, text);
+  updateUserAnalytics(chatId, from.id, analyzeSentiment(text));
+
+  // Broadcast: if owner is sending broadcast text
+  if (isOwner(from.id) && hasPendingBroadcast(from.id)) {
+    await executeBroadcast(bot, chatId, from.id, text);
+    return;
+  }
+
+  // Check custom group commands first
+  const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+  if (isGroup) {
+    const handled = await handleGroupCommand(bot, msg, text).catch(() => false);
+    if (handled) return;
+
+    // Run auto-moderation
+    const blocked = await runAutoModeration(msg).catch(() => false);
+    if (blocked) return;
+
+    // Record for conflict detection
+    recordForConflict(chatId, from.id, text);
+  }
+
   try {
-    const reply = await chat(chatId, msg.text);
-    void detectAndScheduleFollowUp(chatId, msg.text);
-    await sendWithTyping(chatId, reply);
+    const reply = await chat(from.id, chatId, text);
+    void detectAndScheduleFollowUp(from.id, text);
+    if (reply?.trim()) await sendWithTyping(chatId, reply);
   } catch (err) {
     logger.error({ err }, "Chat error");
-    await bot.sendMessage(chatId, "что-то пошло не так, попробуй ещё раз");
+    await bot.sendMessage(chatId, "что-то пошло не так, попробуй ещё раз").catch(() => {});
   }
 });
 
-bot.on("polling_error", (err) => { logger.error({ err }, "Telegram polling error"); });
+// ─── Polling error handler ────────────────────────────────────────────────────
+
+bot.on("polling_error", (err) => {
+  logger.error({ err }, "Telegram polling error — continuing");
+});
 
 logger.info("Telegram bot started — full feature set enabled");
 

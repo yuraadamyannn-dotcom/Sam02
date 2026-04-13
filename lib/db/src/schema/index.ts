@@ -6,3 +6,7 @@ export * from "./group_settings";
 export * from "./group_commands";
 export * from "./group_warnings";
 export * from "./marriages";
+export * from "./bot_chats";
+export * from "./user_analytics";
+export * from "./message_log";
+export * from "./moderation_config";
