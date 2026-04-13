@@ -22,6 +22,7 @@ import { checkFlood, isSpam } from "./utils/spam";
 import { searchYouTube, downloadAndSendAudio, handleLyricsCallback, hasPrefix } from "./music";
 import { storePayload, getPayload } from "./callback_store";
 import { generateWaifu } from "./waifu";
+import { getAIResponse, getJSONResponse, getProviderStatus } from "./ai_router";
 import {
   handleDuel, handleDuelCallback, handleMarry, handleMarryCallback,
   handleDivorce, handleMarriageStatus, handleMafia, handleMafiaCallback, handleMafiaEnd,
@@ -553,14 +554,10 @@ async function updateMemoryBackground(userId: number, history: ChatMessage[]): P
       : "Памяти нет.";
     const prompt = `${curMem}\n\nПоследний диалог:\n${recent.map(m => `${m.role === "user" ? "Пользователь" : "Сэм"}: ${m.content}`).join("\n")}\n\nОбнови память. JSON: {"name":"...","interests":"...","summary":"...","notes":"..."}\nПустая строка если нет данных. Макс 200 символов каждое поле. Не выдумывай.`;
 
-    const resp = await withRetry(() => groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 300,
-      response_format: { type: "json_object" },
-    }), { label: "memory update" });
-
-    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? "{}") as Record<string, string>;
+    const parsed = await getJSONResponse<Record<string, string>>(
+      [{ role: "user", content: prompt }],
+      { maxTokens: 300, jsonMode: true, label: "memory update" }
+    );
     await db.insert(userMemoryTable).values({
       userId, name: parsed.name || null, interests: parsed.interests || null,
       summary: parsed.summary || null, notes: parsed.notes || null, lastUpdated: new Date(),
@@ -581,14 +578,10 @@ async function updateMemoryBackground(userId: number, history: ChatMessage[]): P
 
 async function detectAndScheduleFollowUp(userId: number, userText: string): Promise<void> {
   try {
-    const resp = await withRetry(() => groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: `Пользователь написал: "${userText}"\nНужно ли написать первым через некоторое время? JSON: {"should_followup":bool,"delay_minutes":число,"topic":"о чём"}\nЕсли нет: {"should_followup":false}\ndelay_minutes 30-300.` }],
-      max_tokens: 100,
-      response_format: { type: "json_object" },
-    }), { label: "followup detect" });
-
-    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? "{}") as { should_followup?: boolean; delay_minutes?: number; topic?: string };
+    const parsed = await getJSONResponse<{ should_followup?: boolean; delay_minutes?: number; topic?: string }>(
+      [{ role: "user", content: `Пользователь написал: "${userText}"\nНужно ли написать первым через некоторое время? JSON: {"should_followup":bool,"delay_minutes":число,"topic":"о чём"}\nЕсли нет: {"should_followup":false}\ndelay_minutes 30-300.` }],
+      { maxTokens: 100, jsonMode: true, label: "followup detect" }
+    );
     if (!parsed.should_followup || !parsed.delay_minutes || !parsed.topic) return;
     await db.insert(scheduledMessagesTable).values({
       userId, scheduledAt: new Date(Date.now() + parsed.delay_minutes * 60_000),

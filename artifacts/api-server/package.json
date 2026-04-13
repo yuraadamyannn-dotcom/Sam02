@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
     "cookie-parser": "^1.4.7",
@@ -21,6 +22,7 @@
     "groq-sdk": "^1.1.2",
     "node-gtts": "^2.0.2",
     "node-telegram-bot-api": "^0.67.0",
+    "openai": "^6.34.0",
     "pino": "^9",
     "pino-http": "^10"
   },
