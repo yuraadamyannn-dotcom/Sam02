@@ -19,7 +19,7 @@ import { analyzeSentiment, detectConflictContext } from "./utils/sentiment";
 import { checkFlood, isSpam } from "./utils/spam";
 
 // ─── Modules ──────────────────────────────────────────────────────────────────
-import { searchYouTube, sendMusicResult, handleLyricsCallback } from "./music";
+import { searchYouTube, downloadAndSendAudio, handleLyricsCallback } from "./music";
 import {
   handleDuel, handleDuelCallback, handleMarry, handleMarryCallback,
   handleDivorce, handleMarriageStatus, handleMafia, handleMafiaCallback, handleMafiaEnd,
@@ -646,13 +646,20 @@ async function webSearch(query: string): Promise<string> {
 
 function isMusicRequest(text: string): string | null {
   const patterns = [
-    /(?:найди|поищи|скинь|включи|хочу послушать|поставь)\s+(?:песню|трек|музыку|song)?\s*[«"]?(.+?)[»"]?$/i,
-    /(?:песня|трек|song)\s+[«"]?(.+?)[»"]?$/i,
-    /(?:это|ищу)\s+(?:песня|трек|song)\s+[«"]?(.+?)[»"]?/i,
+    // "найди трек X", "найди песню X", "дай трек X", "дай песню X"
+    /(?:найди|поищи|скинь|включи|хочу послушать|поставь|дай|давай|кинь)\s+(?:мне\s+)?(?:трек|песню|музыку|song|track)?\s*[«""]?(.+?)[»""]?$/i,
+    // "найди трек" / "найди песню" без слова song/трек
+    /^(?:найди|поищи|скинь|дай)\s+[«""]?(.+?)[»""]?$/i,
+    // "трек X" / "песня X"
+    /^(?:песня|трек|song|track)\s+[«""]?(.+?)[»""]?$/i,
+    // "это песня X" / "ищу трек X"
+    /(?:это|ищу)\s+(?:песня|трек|song|track)\s+[«""]?(.+?)[»""]?/i,
+    // "поставь X" / "включи X"
+    /^(?:поставь|включи|врубай|врубить)\s+[«""]?(.+?)[»""]?$/i,
   ];
   for (const p of patterns) {
     const m = text.match(p);
-    if (m?.[1] && m[1].length > 3) return m[1].trim();
+    if (m?.[1] && m[1].trim().length > 2) return m[1].trim();
   }
   return null;
 }
@@ -664,14 +671,18 @@ async function chat(userId: number, chatId: number, userText: string): Promise<s
   const key = convKey(chatId, userId);
   const history = conversations.get(key) ?? [];
 
-  // Music request detection
+  // Music request detection — search is quick, download runs in background
   const musicQuery = isMusicRequest(userText);
   if (musicQuery) {
     const track = await searchYouTube(musicQuery);
     if (track) {
-      await sendMusicResult(bot, chatId, track);
-      return "нашёл вот)";
+      // Fire and forget: download + send audio without blocking the response
+      void downloadAndSendAudio(bot, chatId, track).catch((err) => {
+        logger.error({ err }, "downloadAndSendAudio background error");
+      });
+      return `ищу «${track.title}», сейчас принесу)`;
     }
+    return "не нашёл такой трек, попробуй написать точнее";
   }
 
   // Factual question → web search enrichment
@@ -718,45 +729,88 @@ async function getStats(): Promise<string> {
   const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
-  const [totalRow] = await db.select({ total: count(), totalMessages: sum(telegramUsersTable.messageCount) }).from(telegramUsersTable);
-  const [activeDay] = await db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, dayAgo));
-  const [activeWeek] = await db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, weekAgo));
-  const [newToday] = await db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.firstSeen, today));
-  const [pending] = await db.select({ count: count() }).from(scheduledMessagesTable).where(eq(scheduledMessagesTable.status, "pending"));
-  const [stickerCount] = await db.select({ count: count() }).from(botStickersTable);
+  // Run each query independently so one failure doesn't kill the whole stats
+  const safeQuery = async <T>(fn: () => Promise<T>, fallback: T): Promise<T> => {
+    try { return await fn(); } catch (err) {
+      logger.warn({ err }, "stats query failed, using fallback");
+      return fallback;
+    }
+  };
 
-  const stickerPacks = await db.selectDistinct({ setName: botStickersTable.setName })
-    .from(botStickersTable).where(sql`${botStickersTable.setName} IS NOT NULL`);
+  const [totalRow] = await safeQuery(
+    () => db.select({ total: count(), totalMessages: sum(telegramUsersTable.messageCount) }).from(telegramUsersTable),
+    [{ total: 0, totalMessages: "0" }]
+  );
+  const [activeDay] = await safeQuery(
+    () => db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, dayAgo)),
+    [{ count: 0 }]
+  );
+  const [activeWeek] = await safeQuery(
+    () => db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, weekAgo)),
+    [{ count: 0 }]
+  );
+  const [newToday] = await safeQuery(
+    () => db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.firstSeen, today)),
+    [{ count: 0 }]
+  );
+  const [pending] = await safeQuery(
+    () => db.select({ count: count() }).from(scheduledMessagesTable).where(eq(scheduledMessagesTable.status, "pending")),
+    [{ count: 0 }]
+  );
+  const [stickerCount] = await safeQuery(
+    () => db.select({ count: count() }).from(botStickersTable),
+    [{ count: 0 }]
+  );
+  const stickerPacks = await safeQuery(
+    () => db.selectDistinct({ setName: botStickersTable.setName })
+      .from(botStickersTable).where(sql`${botStickersTable.setName} IS NOT NULL`),
+    [] as Array<{ setName: string | null }>
+  );
+  const topUsers = await safeQuery(
+    () => db.select({
+      firstName: telegramUsersTable.firstName,
+      username: telegramUsersTable.username,
+      messageCount: telegramUsersTable.messageCount,
+    }).from(telegramUsersTable).orderBy(sql`${telegramUsersTable.messageCount} desc`).limit(5),
+    [] as Array<{ firstName: string | null; username: string | null; messageCount: number }>
+  );
 
-  const topUsers = await db.select({
-    firstName: telegramUsersTable.firstName,
-    username: telegramUsersTable.username,
-    messageCount: telegramUsersTable.messageCount,
-  }).from(telegramUsersTable).orderBy(sql`${telegramUsersTable.messageCount} desc`).limit(5);
+  const uptime = Math.floor(process.uptime());
+  const h = Math.floor(uptime / 3600);
+  const m = Math.floor((uptime % 3600) / 60);
+  const mem = process.memoryUsage();
 
-  const topList = topUsers.map((u, i) =>
-    `${i + 1}. ${u.username ? `@${u.username}` : (u.firstName ?? "—")} — ${u.messageCount} сообщ.`
-  ).join("\n");
+  const topList = topUsers.length > 0
+    ? topUsers.map((u, i) =>
+        `${i + 1}. ${u.username ? `@${u.username}` : (u.firstName ?? "—")} — ${u.messageCount ?? 0} сообщ.`
+      ).join("\n")
+    : "пока никого нет";
 
   const packLinks = stickerPacks.filter(p => p.setName)
     .map(p => `• <a href="https://t.me/addstickers/${p.setName}">${p.setName}</a>`)
     .join("\n");
 
   return [
-    `📊 <b>Статистика бота</b>`, ``,
+    `📊 <b>Статистика бота</b>`,
+    ``,
     `👥 Пользователей: <b>${totalRow?.total ?? 0}</b>`,
-    `💬 Сообщений: <b>${totalRow?.totalMessages ?? 0}</b>`, ``,
-    `🟢 Актив 24ч: <b>${activeDay?.count ?? 0}</b>`,
-    `📅 Актив неделя: <b>${activeWeek?.count ?? 0}</b>`,
+    `💬 Сообщений всего: <b>${totalRow?.totalMessages ?? 0}</b>`,
+    ``,
+    `🟢 Активны за 24ч: <b>${activeDay?.count ?? 0}</b>`,
+    `📅 Активны за неделю: <b>${activeWeek?.count ?? 0}</b>`,
     `✨ Новых сегодня: <b>${newToday?.count ?? 0}</b>`,
-    `⏰ Запланировано: <b>${pending?.count ?? 0}</b>`, ``,
+    `⏰ Запланировано: <b>${pending?.count ?? 0}</b>`,
+    ``,
     `🎭 Стикеров: <b>${stickerCount?.count ?? 0}</b>`,
     stickerPacks.length > 0 ? `📦 Паки стикеров (${stickerPacks.length}):\n${packLinks}` : "",
     ``,
-    `🏆 <b>Топ-5:</b>`,
-    topList || "пока никого нет",
+    `🏆 <b>Топ-5 по сообщениям:</b>`,
+    topList,
     ``,
+    `⏱ Аптайм: <b>${h}ч ${m}м</b>`,
+    `💾 RAM: <b>${Math.round(mem.heapUsed / 1024 / 1024)} МБ</b>`,
     `🔊 ElevenLabs: ${eleven ? "✅" : "❌"}`,
+    `🧠 Groq: ✅`,
   ].filter(l => l !== "").join("\n");
 }
 
