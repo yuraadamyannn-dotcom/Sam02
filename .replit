@@ -24,12 +24,13 @@ args = "Start application"
 name = "Start application"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "webview"
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "pnpm --filter @workspace/api-server run dev"
-
-[workflows.workflow.metadata]
-outputType = "console"
+args = "BOT_POLLING=true PORT=8081 pnpm --filter @workspace/api-server run dev"
+waitForPort = 8081
 
 [agent]
 stack = "PNPM_WORKSPACE"

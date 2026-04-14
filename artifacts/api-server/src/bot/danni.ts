@@ -29,9 +29,28 @@ export async function handleDanniUser(
     return;
   }
 
-  const userId = (targetUser as TelegramBot.User)?.id ?? msg.reply_to_message?.from?.id;
+  let userId = (targetUser as TelegramBot.User)?.id || msg.reply_to_message?.from?.id;
+  const mentionUsername = (targetUser as TelegramBot.User)?.username;
+
+  // If we have a username but no valid ID, look up in DB
+  if ((!userId || userId === 0) && mentionUsername) {
+    const cleanName = mentionUsername.replace(/^@/, "").toLowerCase();
+    const [found] = await db
+      .select({ userId: telegramUsersTable.userId })
+      .from(telegramUsersTable)
+      .where(sql`LOWER(${telegramUsersTable.username}) = ${cleanName}`)
+      .limit(1);
+    if (found) userId = found.userId;
+  }
+
   if (!userId) {
-    await bot.sendMessage(chatId, "Укажи пользователя: /danni @username или ответь на сообщение", { reply_to_message_id: msg.message_id });
+    await bot.sendMessage(
+      chatId,
+      mentionUsername
+        ? `Пользователь @${mentionUsername} не найден в базе. Он должен был написать боту хотя бы раз.`
+        : "Укажи пользователя: /danni @username или ответь на сообщение",
+      { reply_to_message_id: msg.message_id },
+    );
     return;
   }
 

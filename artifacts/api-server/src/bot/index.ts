@@ -50,7 +50,10 @@ const groqKey = process.env["GROQ_API_KEY"]!;
 if (!groqKey) throw new Error("GROQ_API_KEY required");
 const elevenKey = process.env["ELEVENLABS_API_KEY"];
 
-const bot = new TelegramBot(token, { polling: true });
+// Only poll Telegram when BOT_POLLING=true — prevents double-polling when
+// multiple workflows start the same server (e.g. artifact workflow + Start application).
+const BOT_POLLING = process.env["BOT_POLLING"] === "true";
+const bot = new TelegramBot(token, { polling: BOT_POLLING });
 const groq = new Groq({ apiKey: groqKey });
 const eleven = elevenKey ? new ElevenLabsClient({ apiKey: elevenKey }) : null;
 
@@ -199,15 +202,22 @@ function cleanUp(...files: string[]) {
 }
 
 function extractUserFromText(text: string, msg: TelegramBot.Message): TelegramBot.User | null {
-  // Try reply target first
+  // Try text_mention entity first (has full User object)
+  if (msg.entities) {
+    for (const entity of msg.entities) {
+      if (entity.type === "text_mention" && entity.user) {
+        return entity.user;
+      }
+    }
+  }
+  // Try reply target
   if (msg.reply_to_message?.from && !msg.reply_to_message.from.is_bot) {
     return msg.reply_to_message.from;
   }
-  // Try @username in text
-  const match = text.match(/@([a-zA-Z0-9_]+)/);
+  // Try @username in text — return partial object with username so caller can do DB lookup
+  const match = text.match(/@([a-zA-Z0-9_]{4,})/);
   if (match) {
-    // We can't resolve @username to user without entity info, return minimal
-    return null;
+    return { id: 0, is_bot: false, first_name: match[1], username: match[1] } as TelegramBot.User;
   }
   return null;
 }
