@@ -2,7 +2,7 @@ import TelegramBot from "node-telegram-bot-api";
 import Groq from "groq-sdk";
 import ffmpeg from "fluent-ffmpeg";
 import { ElevenLabsClient } from "elevenlabs";
-import { db } from "@workspace/db";
+import { db, pool } from "@workspace/db";
 import {
   telegramUsersTable, userMemoryTable, scheduledMessagesTable, botStickersTable,
   groupSettingsTable, moderationConfigTable, messageLogTable, groupWarningsTable, botChatsTable,
@@ -113,6 +113,63 @@ function markProcessed(msgId: number): boolean {
   }
   return true;
 }
+
+const processedCommandKeys = new Set<string>();
+let commandDedupeReady: Promise<void> | null = null;
+
+function markLocalCommandProcessed(msg: TelegramBot.Message): boolean {
+  const key = `${msg.chat.id}:${msg.message_id}`;
+  if (processedCommandKeys.has(key)) return false;
+  processedCommandKeys.add(key);
+  if (processedCommandKeys.size > 3000) {
+    const first = processedCommandKeys.values().next().value;
+    if (first !== undefined) processedCommandKeys.delete(first);
+  }
+  return true;
+}
+
+function ensureCommandDedupeTable(): Promise<void> {
+  commandDedupeReady ??= (async () => {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_processed_commands (
+        chat_id BIGINT NOT NULL,
+        message_id INTEGER NOT NULL,
+        processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (chat_id, message_id)
+      )
+    `);
+    await pool.query("DELETE FROM bot_processed_commands WHERE processed_at < now() - interval '2 days'");
+  })();
+  return commandDedupeReady;
+}
+
+async function claimCommandMessage(msg: TelegramBot.Message): Promise<boolean> {
+  if (!msg.text?.startsWith("/")) return true;
+  if (!markLocalCommandProcessed(msg)) return false;
+  try {
+    await ensureCommandDedupeTable();
+    const result = await pool.query(
+      "INSERT INTO bot_processed_commands (chat_id, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+      [msg.chat.id, msg.message_id],
+    );
+    return result.rowCount === 1;
+  } catch (err) {
+    logger.warn({ err, chatId: msg.chat.id, messageId: msg.message_id }, "Command DB dedupe unavailable, using local guard");
+    return true;
+  }
+}
+
+const originalOnText = bot.onText.bind(bot);
+bot.onText = ((regexp, callback) => {
+  return originalOnText(regexp, (msg, match) => {
+    void (async () => {
+      if (!(await claimCommandMessage(msg))) return;
+      await callback(msg, match);
+    })().catch((err) => {
+      logger.error({ err, regexp: String(regexp), chatId: msg.chat.id, messageId: msg.message_id }, "Command handler failed");
+    });
+  });
+}) as TelegramBot["onText"];
 
 // ─── Conversation history ─────────────────────────────────────────────────────
 // Key: `${chatId}:${userId}` for per-user per-chat context
@@ -1919,11 +1976,11 @@ bot.onText(/^\/start(?:\s+(.+))?/, async (msg, match) => {
   await sendWithTyping(chatId, `о, привет ${firstName}) я сэм, мне 17, могу просто поговорить или помочь с чем-то по группе\n\nпиши что хочешь, я тут`);
 });
 
-bot.onText(/^\/help/, async (msg) => {
+bot.onText(/^\/help(?:\s|$)/, async (msg) => {
   await bot.sendMessage(msg.chat.id, `используй /skills — там всё`, { reply_to_message_id: msg.message_id });
 });
 
-bot.onText(/^\/skills/, async (msg) => {
+bot.onText(/^\/skills(?:\s|$)/, async (msg) => {
   await trackBotChat(bot, msg);
   await sendSkillsMenu(msg.chat.id);
 });
@@ -2028,7 +2085,7 @@ bot.onText(/^\/waifu(?:\s+(.+))?$/, async (msg, match) => {
   }
 });
 
-bot.onText(/^\/clear/, async (msg) => {
+bot.onText(/^\/clear(?:\s|$)/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from?.id ?? chatId;
   conversations.delete(convKey(chatId, userId));
@@ -2049,7 +2106,7 @@ bot.onText(/^\/stat$/, async (msg) => {
   }
 });
 
-bot.onText(/^\/stata/, async (msg) => {
+bot.onText(/^\/stata(?:\s|$)/, async (msg) => {
   if (!isOwner(msg.from?.id ?? 0)) {
     await bot.sendMessage(msg.chat.id, "только для владельца", { reply_to_message_id: msg.message_id });
     return;
@@ -2064,7 +2121,7 @@ bot.onText(/^\/stata/, async (msg) => {
 });
 
 // /status — bot health (owner only)
-bot.onText(/^\/status/, async (msg) => {
+bot.onText(/^\/status(?:\s|$)/, async (msg) => {
   if (!isOwner(msg.from?.id ?? 0)) return;
   const mem = process.memoryUsage();
   const uptime = Math.floor(process.uptime());
@@ -2097,7 +2154,7 @@ bot.onText(/^\/danni(?:_chat)?(\s+.*)?$/, async (msg, match) => {
 });
 
 // /export_data
-bot.onText(/^\/export_data/, async (msg) => {
+bot.onText(/^\/export_data(?:\s|$)/, async (msg) => {
   await handleExportData(bot, msg);
 });
 
@@ -2116,13 +2173,13 @@ bot.onText(/^\/broadcast(?:\s+(@\S+)\s+(.+))?/, async (msg, m) => {
 });
 
 // Group admin commands
-bot.onText(/^\/rules/, async (msg) => { await handleRules(bot, msg); });
-bot.onText(/^\/setrules\s*(.+)?/, async (msg, m) => { await handleSetRules(bot, msg, m?.[1] ?? ""); });
-bot.onText(/^\/setwelcome\s*(.+)?/, async (msg, m) => { await handleSetWelcome(bot, msg, m?.[1] ?? ""); });
-bot.onText(/^\/chatstats/, async (msg) => { await handleGroupStats(bot, msg); });
+bot.onText(/^\/rules(?:\s|$)/, async (msg) => { await handleRules(bot, msg); });
+bot.onText(/^\/setrules(?:\s+([\s\S]+))?$/, async (msg, m) => { await handleSetRules(bot, msg, m?.[1] ?? ""); });
+bot.onText(/^\/setwelcome(?:\s+([\s\S]+))?$/, async (msg, m) => { await handleSetWelcome(bot, msg, m?.[1] ?? ""); });
+bot.onText(/^\/chatstats(?:\s|$)/, async (msg) => { await handleGroupStats(bot, msg); });
 
 // ── /chathealth — chat atmosphere & member report ──────────────────────────
-bot.onText(/^\/chathealth/, async (msg) => {
+bot.onText(/^\/chathealth(?:\s|$)/, async (msg) => {
   const chatId = msg.chat.id;
   const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
   if (!isGroup) {
@@ -2135,7 +2192,7 @@ bot.onText(/^\/chathealth/, async (msg) => {
 });
 
 // ── /members — member count + admin list ──────────────────────────────────
-bot.onText(/^\/members/, async (msg) => {
+bot.onText(/^\/members(?:\s|$)/, async (msg) => {
   const chatId = msg.chat.id;
   const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
   if (!isGroup) {
@@ -2173,13 +2230,13 @@ bot.onText(/^\/members/, async (msg) => {
 });
 
 // ── /interactive — manually trigger a random interactive ──────────────────
-bot.onText(/^\/interactive/, async (msg) => {
+bot.onText(/^\/interactive(?:\s|$)/, async (msg) => {
   const chatId = msg.chat.id;
   const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
   if (!isGroup) return;
   await startRandomInteractive(bot, groq, SYSTEM_PROMPT_BASE, chatId);
 });
-bot.onText(/^\/cmds/, async (msg) => { await handleListCmds(bot, msg); });
+bot.onText(/^\/cmds(?:\s|$)/, async (msg) => { await handleListCmds(bot, msg); });
 
 bot.onText(/^\/addcmd\s+(\S+)\s+(.+)/, async (msg, m) => {
   await handleAddCmd(bot, msg, m?.[1] ?? "", m?.[2] ?? "");
@@ -2188,11 +2245,11 @@ bot.onText(/^\/delcmd\s+(\S+)/, async (msg, m) => {
   await handleDelCmd(bot, msg, m?.[1] ?? "");
 });
 
-bot.onText(/^\/ban/, async (msg) => {
+bot.onText(/^\/ban(?:\s|$)/, async (msg) => {
   const target = extractUserFromText(msg.text ?? "", msg);
   await handleBan(bot, msg, target);
 });
-bot.onText(/^\/unban/, async (msg) => {
+bot.onText(/^\/unban(?:\s|$)/, async (msg) => {
   const target = extractUserFromText(msg.text ?? "", msg);
   await handleUnban(bot, msg, target);
 });
@@ -2200,19 +2257,19 @@ bot.onText(/^\/mute(?:\s+(\d+))?/, async (msg, m) => {
   const target = extractUserFromText(msg.text ?? "", msg);
   await handleMute(bot, msg, target, parseInt(m?.[1] ?? "60"));
 });
-bot.onText(/^\/unmute/, async (msg) => {
+bot.onText(/^\/unmute(?:\s|$)/, async (msg) => {
   const target = extractUserFromText(msg.text ?? "", msg);
   await handleUnmute(bot, msg, target);
 });
-bot.onText(/^\/warn(?:\s+(.+))?/, async (msg, m) => {
+bot.onText(/^\/warn(?:\s+(.+))?$/, async (msg, m) => {
   const target = extractUserFromText(msg.text ?? "", msg);
   await handleWarn(bot, msg, target, m?.[1]);
 });
-bot.onText(/^\/warns/, async (msg) => {
+bot.onText(/^\/warns(?:\s|$)/, async (msg) => {
   const target = extractUserFromText(msg.text ?? "", msg);
   await handleWarns(bot, msg, target);
 });
-bot.onText(/^\/unwarn/, async (msg) => {
+bot.onText(/^\/unwarn(?:\s|$)/, async (msg) => {
   const target = extractUserFromText(msg.text ?? "", msg);
   await handleUnwarn(bot, msg, target);
 });
@@ -2253,23 +2310,23 @@ bot.onText(/^\/setrule\s+(.+)/, async (msg, m) => {
   await bot.sendMessage(chatId, `✅ Правило добавлено.`, { reply_to_message_id: msg.message_id });
 });
 
-bot.onText(/^\/ruleslist/, async (msg) => { await handleRules(bot, msg); });
+bot.onText(/^\/ruleslist(?:\s|$)/, async (msg) => { await handleRules(bot, msg); });
 
 // ─── Referral & engagement commands ──────────────────────────────────────────
 
-bot.onText(/^\/invite/, async (msg) => {
+bot.onText(/^\/invite(?:\s|$)/, async (msg) => {
   await handleInvite(bot, msg, BOT_USERNAME);
 });
 
-bot.onText(/^\/referrals/, async (msg) => {
+bot.onText(/^\/referrals(?:\s|$)/, async (msg) => {
   await handleReferrals(bot, msg);
 });
 
-bot.onText(/^\/invitestats/, async (msg) => {
+bot.onText(/^\/invitestats(?:\s|$)/, async (msg) => {
   await handleInviteStats(bot, msg);
 });
 
-bot.onText(/^\/dmlink/, async (msg) => {
+bot.onText(/^\/dmlink(?:\s|$)/, async (msg) => {
   await handleDmLink(bot, msg, BOT_USERNAME);
 });
 
@@ -2293,12 +2350,12 @@ bot.onText(/^\/mention\s+(@\S+)(?:\s+(.+))?/, async (msg, m) => {
 });
 
 // /stats — engagement stats panel for admins
-bot.onText(/^\/stats/, async (msg) => {
+bot.onText(/^\/stats(?:\s|$)/, async (msg) => {
   await handleEngagementStats(bot, msg);
 });
 
 // /spam_check — audit newly joined users
-bot.onText(/^\/spam_check/, async (msg) => {
+bot.onText(/^\/spam_check(?:\s|$)/, async (msg) => {
   await handleSpamCheck(bot, msg);
 });
 
@@ -2308,20 +2365,18 @@ bot.onText(/^\/whitelist(?:\s+(.+))?/, async (msg, m) => {
 });
 
 // Game commands
-bot.onText(/^\/duel/, async (msg) => {
+bot.onText(/^\/duel(?:\s|$)/, async (msg) => {
   const target = extractUserFromText(msg.text ?? "", msg);
   await handleDuel(bot, msg, target);
 });
-bot.onText(/^\/marry/, async (msg) => {
+bot.onText(/^\/marry(?:\s|$)/, async (msg) => {
   const target = extractUserFromText(msg.text ?? "", msg);
   await handleMarry(bot, msg, target);
 });
-bot.onText(/^\/divorce/, async (msg) => { await handleDivorce(bot, msg); });
-bot.onText(/^\/marriage/, async (msg) => { await handleMarriageStatus(bot, msg); });
-bot.onText(/^\/mafia/, async (msg) => {
-  if (!msg.text?.startsWith("/mafiaend")) await handleMafia(bot, msg);
-});
-bot.onText(/^\/mafiaend/, async (msg) => { await handleMafiaEnd(bot, msg); });
+bot.onText(/^\/divorce(?:\s|$)/, async (msg) => { await handleDivorce(bot, msg); });
+bot.onText(/^\/marriage(?:\s|$)/, async (msg) => { await handleMarriageStatus(bot, msg); });
+bot.onText(/^\/mafia(?:\s|$)/, async (msg) => { await handleMafia(bot, msg); });
+bot.onText(/^\/mafiaend(?:\s|$)/, async (msg) => { await handleMafiaEnd(bot, msg); });
 
 // ─── New member handler ───────────────────────────────────────────────────────
 

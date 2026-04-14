@@ -2,7 +2,7 @@
 
 ## Overview
 
-pnpm workspace monorepo using TypeScript. Telegram AI bot "Сэм (Sam)" — a 20-year-old AI persona with multimedia capabilities, group admin features, games, and analytics.
+pnpm workspace monorepo using TypeScript. Telegram AI bot "Сэм (Sam)" — a 17-year-old AI persona with multimedia capabilities, group admin features, games, and analytics.
 
 ## Stack
 
@@ -59,6 +59,7 @@ pnpm workspace monorepo using TypeScript. Telegram AI bot "Сэм (Sam)" — a 2
 - `user_analytics` — per-user-per-chat activity + sentiment
 - `message_log` — recent message log for conflict analysis (last 500/chat)
 - `moderation_config` — per-group moderation settings
+- `bot_processed_commands` — command deduplication guard keyed by chat/message ID
 
 ### Owner
 - Username: @Wuixoll
@@ -107,3 +108,7 @@ python-telegram-bot==21.10, google-generativeai==0.8.5, openai==1.82.0, groq==0.
 - `ELEVENLABS_API_KEY` — optional (TS TTS; falls back to no voice if missing)
 - `SESSION_SECRET` — Express session
 - `DATABASE_URL` — PostgreSQL connection
+
+## Runtime Notes
+- Main Telegram polling runs from `artifacts/api-server: API Server`; the fallback `Start application` workflow is configured with `BOT_POLLING=false` to avoid duplicate Telegram polling.
+- The DB schema has been pushed with `pnpm --filter @workspace/db run push`; missing-table errors such as `user_memory` should not occur unless a new database is attached.
