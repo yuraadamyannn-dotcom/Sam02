@@ -61,7 +61,7 @@ import {
   handleWhitelist, handleSpamCheck, handleEngagementStats,
   handleMassAddUsers, handleMention,
   isEngagementCallback, handleEngagementCallback,
-  isWhitelisted,
+  isWhitelisted, detectMassModAction, executeMassModAction,
 } from "./engagement";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
@@ -1154,18 +1154,28 @@ const SKILLS_PAGES: Record<string, { title: string; text: string }> = {
 <code>/rules</code> — показать правила чата
 <code>/setrules [текст]</code> — установить правила (только админ)
 <code>/setwelcome [текст]</code> — приветствие новых ({name} = имя)
-📊 <code>/chatstats</code> — статистика активности чата
+<code>/chatstats</code> — статистика активности чата
 
 📝 <b>Кастомные команды</b>
 <code>/addcmd !триггер ответ</code> — добавить авто-ответ
 <code>/delcmd !триггер</code> — удалить команду
 <code>/cmds</code> — список всех команд чата
 
-🔨 <b>Модерация</b>
+🔨 <b>Модерация (командами)</b>
 <code>/ban [@user/reply] [причина]</code> — навсегда забанить
 <code>/unban @user</code> — разбанить
 <code>/mute [@user/reply] [минуты]</code> — замутить (по умолчанию 10 мин)
 <code>/unmute [@user/reply]</code> — снять мут
+
+🗣 <b>Модерация голосом (только для админов)</b>
+Напиши в чат — Сэм выполнит:
+<code>Сэм забань @user1 @user2</code> — забанить одного или нескольких
+<code>Сэм кикни @user1 @user2</code> — кикнуть (могут вернуться)
+<code>удали их @user1, @user2, @user3</code> — массовый кик
+<code>забань их @user1 @user2 @user3</code> — массовый бан
+• Работает с @username и с именными ссылками (tap-to-mention)
+• Только для администраторов чата
+• Для одного — нужен префикс "Сэм"; для нескольких — достаточно ключевых слов
 
 ⚠️ <b>Система предупреждений</b>
 <code>/warn [@user/reply] [причина]</code> — выдать варн (3 варна = авто-бан)
@@ -1177,7 +1187,8 @@ const SKILLS_PAGES: Record<string, { title: string; text: string }> = {
 <code>/autoban on/off</code> — авто-бан агрессора при конфликте
 • Анти-флуд: мут на 5 мин при 5+ сообщениях за 10 секунд
 • Анти-спам: автоудаление спам-паттернов
-• Детекция конфликтов: анализ тональности, мут на 30 мин`,
+• Детекция конфликтов: анализ тональности, мут на 30 мин
+• Капча для новых участников (можно отключить через белый список)`,
   },
   games: {
     title: "🎮 Игры",
@@ -1232,6 +1243,46 @@ const SKILLS_PAGES: Record<string, { title: string; text: string }> = {
 Определяет зачинщика (агрессора) по паттернам
 Принимает меры: предупреждение, мут или бан`,
   },
+  engagement: {
+    title: "🚀 Вовлечённость",
+    text: `<b>🚀 Система вовлечённости и роста</b>
+
+🔗 <b>Реферальные ссылки</b>
+<code>/invite</code> — получить свою реферальную ссылку (7 дней)
+<code>/referrals</code> — рейтинг лучших пригласителей чата
+<code>/invitestats</code> — твоя личная статистика приглашений
+
+👤 <b>Добавление пользователей</b>
+<code>/adduser @user1 @user2</code> — создать ссылки для конкретных пользователей
+<code>/add_users @u1 @u2 @u3 ...</code> — массовое создание ссылок
+• Лимит: 50 добавлений в час на чат (авто-сброс)
+
+📨 <b>Упоминания и ЛС</b>
+<code>/mention @user текст</code> — упомянуть пользователя с кнопкой "Написать"
+<code>/dmlink</code> — кнопка "Написать Сэму в личку" для чата
+<code>/broadcast @user текст</code> — рассылка с deep-link кнопкой
+
+🛡 <b>Белый список</b>
+<code>/whitelist add @user</code> — добавить в доверенные (пропускают капчу и лимиты)
+<code>/whitelist remove @user</code> — убрать из белого списка
+<code>/whitelist list</code> — посмотреть всех доверенных
+
+🔍 <b>Антиспам-аудит</b>
+<code>/spam_check</code> — проверить новичков за 24 ч:
+✅ активные | 🟡 без сообщений | 🔴 с нарушениями
+
+📊 <b>Панель вовлечённости</b>
+<code>/stats</code> — для администраторов чата:
+• Новые участники за 7 дней
+• Топ рефереров
+• Топ активных пользователей
+• Состояние лимита добавлений
+• Размер белого списка
+
+🔒 <b>Капча для новичков</b>
+Каждый новый участник получает кнопку-капчу
+Пользователи из белого списка — пропускают автоматически`,
+  },
   analytics: {
     title: "📊 Аналитика",
     text: `<b>📊 Аналитика и данные (владелец)</b>
@@ -1250,6 +1301,11 @@ const SKILLS_PAGES: Record<string, { title: string; text: string }> = {
 • Распределение тематик сообщений
 • Среднее настроение чата
 • Пиковое время активности
+
+📊 <b>Панель вовлечённости (администраторы)</b>
+<code>/stats</code> — новые участники, рефералы, топ активных, лимиты
+<code>/spam_check</code> — аудит новичков за 24 часа (активность / нарушения)
+<code>/chatstats</code> — общая статистика активности чата
 
 📤 <b>Экспорт данных</b>
 <code>/export_data</code> — получить свои данные в JSON (GDPR)
@@ -1338,10 +1394,13 @@ async function sendSkillsMenu(chatId: number, messageId?: number): Promise<void>
     ],
     [
       { text: "🧠 Психология", callback_data: "skills:psychology" },
-      { text: "📊 Аналитика", callback_data: "skills:analytics" },
+      { text: "🚀 Вовлечённость", callback_data: "skills:engagement" },
     ],
     [
+      { text: "📊 Аналитика", callback_data: "skills:analytics" },
       { text: "🛡 Мониторинг", callback_data: "skills:monitor" },
+    ],
+    [
       { text: "🔧 Инструменты", callback_data: "skills:admin_tools" },
     ],
   ];
@@ -2465,6 +2524,15 @@ bot.on("message", async (msg) => {
     if (blocked) {
       // Clear direct convo for this specific user if they got blocked
       clearDirectConvo(chatId, from.id);
+      return;
+    }
+
+    // ── Natural language mass kick/ban (admin only) ──────────────────────────
+    const massAction = detectMassModAction(text, msg.entities);
+    if (massAction) {
+      await executeMassModAction(bot, msg, massAction).catch(e =>
+        logger.error({ e }, "executeMassModAction error")
+      );
       return;
     }
 

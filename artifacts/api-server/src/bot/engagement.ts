@@ -535,6 +535,161 @@ export async function handleMention(
   });
 }
 
+// ─── Mass mod action: detect & execute kick/ban from natural language ─────────
+
+export interface MassModAction {
+  action: "kick" | "ban";
+  targets: Array<{ id?: number; username?: string; displayName?: string }>;
+}
+
+const BAN_KEYWORDS = [
+  "забань", "забаньте", "бань", "баньте", "перебань",
+  "заблокируй", "заблокируйте", "забанить",
+];
+const KICK_KEYWORDS = [
+  "удали", "удалите", "кикни", "кикните", "выкинь", "выкиньте",
+  "убери", "уберите", "удалить", "кикнуть", "выкинуть",
+];
+// Sam-directed prefixes (make single-target trigger work too)
+const SAM_PREFIXES = /(?:сэм|sam|бот)[,!\s]/i;
+
+export function detectMassModAction(
+  text: string,
+  entities?: TelegramBot.MessageEntity[],
+): MassModAction | null {
+  const lower = text.toLowerCase();
+
+  let action: "kick" | "ban" | null = null;
+  for (const kw of BAN_KEYWORDS) {
+    if (lower.includes(kw)) { action = "ban"; break; }
+  }
+  if (!action) {
+    for (const kw of KICK_KEYWORDS) {
+      if (lower.includes(kw)) { action = "kick"; break; }
+    }
+  }
+  if (!action) return null;
+
+  const isSamDirected = SAM_PREFIXES.test(text);
+
+  const targets: MassModAction["targets"] = [];
+
+  // Extract text_mention entities (users without @username — Telegram links them by name)
+  if (entities) {
+    for (const entity of entities) {
+      if (entity.type === "text_mention" && entity.user) {
+        targets.push({
+          id: entity.user.id,
+          username: entity.user.username,
+          displayName: entity.user.first_name,
+        });
+      }
+    }
+  }
+
+  // Extract explicit @username mentions from text
+  const usernameMatches = [...text.matchAll(/@([a-zA-Z0-9_]{4,32})/g)];
+  for (const m of usernameMatches) {
+    const uname = m[1]!;
+    if (!targets.some(t => t.username?.toLowerCase() === uname.toLowerCase())) {
+      targets.push({ username: uname, displayName: `@${uname}` });
+    }
+  }
+
+  if (!targets.length) return null;
+  // For single target, require direct Sam mention to avoid false positives
+  if (!isSamDirected && targets.length < 2) return null;
+
+  return { action, targets };
+}
+
+// Execute a mass mod action: resolves IDs and bans/kicks each target
+export async function executeMassModAction(
+  bot: TelegramBot,
+  msg: TelegramBot.Message,
+  action: MassModAction,
+): Promise<void> {
+  const chatId = msg.chat.id;
+  const from = msg.from;
+  if (!from) return;
+
+  // Must be admin or owner
+  const adminOk = isOwner(from.id) || await isAdmin(bot, chatId, from.id);
+  if (!adminOk) return; // Silently ignore non-admins
+
+  // Resolve IDs for targets that only have a username
+  const resolved: Array<{ id: number; displayName: string }> = [];
+  const failed: string[] = [];
+
+  for (const target of action.targets) {
+    if (target.id) {
+      resolved.push({ id: target.id, displayName: target.displayName ?? `id${target.id}` });
+      continue;
+    }
+
+    if (target.username) {
+      // Look up in our DB first
+      const clean = target.username.toLowerCase();
+      const [row] = await db.select().from(telegramUsersTable)
+        .where(sql`LOWER(${telegramUsersTable.username}) = ${clean}`)
+        .catch(() => []);
+
+      if (row?.userId) {
+        resolved.push({ id: row.userId, displayName: `@${target.username}` });
+      } else {
+        failed.push(`@${target.username}`);
+      }
+    }
+  }
+
+  if (!resolved.length && failed.length) {
+    await bot.sendMessage(chatId,
+      `⚠️ Не удалось найти пользователей: ${failed.join(", ")}\n` +
+      `<i>Они должны были написать хотя бы раз чтобы бот знал их ID.</i>`,
+      { parse_mode: "HTML", reply_to_message_id: msg.message_id }
+    );
+    return;
+  }
+
+  // Execute action
+  const results: string[] = [];
+  for (const target of resolved) {
+    try {
+      if (action.action === "ban") {
+        await bot.banChatMember(chatId, target.id);
+        results.push(`🔨 ${target.displayName} — забанен`);
+      } else {
+        // Kick = ban then immediately unban so they can rejoin via invite
+        await bot.banChatMember(chatId, target.id);
+        await new Promise(r => setTimeout(r, 300));
+        await bot.unbanChatMember(chatId, target.id, { only_if_banned: true });
+        results.push(`👟 ${target.displayName} — кикнут`);
+      }
+      await new Promise(r => setTimeout(r, 500)); // Rate limit
+    } catch {
+      results.push(`❌ ${target.displayName} — не удалось (нет прав или уже ушёл)`);
+    }
+  }
+
+  if (failed.length) {
+    results.push(``, `⚠️ Не найдены в базе: ${failed.join(", ")}`);
+  }
+
+  const actionLabel = action.action === "ban" ? "Бан" : "Кик";
+  const text = [
+    `🛡 <b>${actionLabel} — выполнено</b>`,
+    ``,
+    ...results,
+  ].join("\n");
+
+  await bot.sendMessage(chatId, text, {
+    parse_mode: "HTML",
+    reply_to_message_id: msg.message_id,
+  });
+
+  logger.info({ chatId, action: action.action, count: resolved.length }, "Mass mod action executed");
+}
+
 // ─── Engagement stats callback handler ────────────────────────────────────────
 
 export function isEngagementCallback(data: string): boolean {
