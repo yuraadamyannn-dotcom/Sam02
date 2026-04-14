@@ -63,7 +63,7 @@ import {
   isEngagementCallback, handleEngagementCallback,
   isWhitelisted, detectMassModAction, executeMassModAction,
 } from "./engagement";
-import { detectWhisper, handleWhisper, handleWhisperCallback } from "./whisper";
+import { detectWhisper, handleWhisper, handleWhisperCallback, isWhisperCommand } from "./whisper";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
@@ -211,6 +211,21 @@ const SYSTEM_PROMPT_BASE = `Ты — Сэм (Sam). Тебе 17 лет. Ты жи
 - [ГОЛОС] — ТОЛЬКО если просят голосовое
 
 НЕ добавляй медиатеги в обычный диалог. Задача — живое общение, не демонстрация функций.`;
+
+function ownerContext(userId: number): string {
+  if (!isOwner(userId)) return "";
+  return `
+
+ВАЖНО ПРО ВЛАДЕЛЬЦА:
+- Текущий собеседник — твой создатель и владелец.
+- Узнавай его всегда: в личке, в группах, в ответах на текст, голос, фото, видео и стикеры.
+- В каждом ответе к нему обращайся естественно как "создатель" или "владелец".
+- Не называй его обычным пользователем и не забывай этот статус после /start.`;
+}
+
+function systemPromptFor(userId: number, extra = ""): string {
+  return SYSTEM_PROMPT_BASE + ownerContext(userId) + extra;
+}
 
 // ─── Artist styles ────────────────────────────────────────────────────────────
 
@@ -466,7 +481,7 @@ async function analyzeVideo(userId: number, chatId: number, videoBuffer: Buffer)
 
   try {
     const memory = await loadMemory(userId);
-    const sysPrompt = SYSTEM_PROMPT_BASE + memory;
+    const sysPrompt = systemPromptFor(userId, memory);
     const key = convKey(chatId, userId);
     const history = conversations.get(key) ?? [];
 
@@ -531,7 +546,7 @@ async function analyzePhoto(userId: number, chatId: number, fileId: string, capt
   const completion = await withRetry(() => groq.chat.completions.create({
     model: "meta-llama/llama-4-scout-17b-16e-instruct",
     messages: [
-      { role: "system", content: SYSTEM_PROMPT_BASE + memory },
+      { role: "system", content: systemPromptFor(userId, memory) },
       ...history,
       { role: "user", content: [
         { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } },
@@ -693,7 +708,7 @@ async function sendScheduledMessages(): Promise<void> {
         const resp = await withRetry(() => groq.chat.completions.create({
           model: "llama-3.3-70b-versatile",
           messages: [
-            { role: "system", content: SYSTEM_PROMPT_BASE + memory },
+            { role: "system", content: systemPromptFor(msg.userId, memory) },
             { role: "user", content: `[Ты пишешь первым. Повод: ${msg.prompt}. Короткое живое сообщение как друг. Без "!"]` },
           ],
           max_tokens: 150,
@@ -850,7 +865,7 @@ async function chat(userId: number, chatId: number, userText: string): Promise<s
     groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages: [
-        { role: "system", content: SYSTEM_PROMPT_BASE + memory },
+        { role: "system", content: systemPromptFor(userId, memory) },
         ...history.slice(0, -1),
         { role: "user", content: enrichedText },
       ],
@@ -1894,7 +1909,7 @@ bot.onText(/^\/start(?:\s+(.+))?/, async (msg, match) => {
   if (memory.length > 0) {
     const resp = await withRetry(() => groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      messages: [{ role: "system", content: SYSTEM_PROMPT_BASE + memory },
+      messages: [{ role: "system", content: systemPromptFor(from?.id ?? chatId, memory) },
         { role: "user", content: `[Пользователь вернулся. Тёплое приветствие как старый друг. Коротко, без "!"]` }],
       max_tokens: 150,
     }), { label: "/start return" });
@@ -2333,7 +2348,7 @@ bot.on("new_chat_members", async (msg) => {
       const memory = await loadMemory(member.id).catch(() => "");
       const isReturning = memory.length > 10;
 
-      const systemCtx = SYSTEM_PROMPT_BASE + `\n\nТы сейчас в группе. В чат только что вступил новый участник по имени ${name}${username ? ` (${username})` : ""}. ${isReturning ? "Этот человек уже общался с тобой раньше — поприветствуй как старого знакомого." : "Это новый человек в чате."}`;
+      const systemCtx = systemPromptFor(member.id, `\n\nТы сейчас в группе. В чат только что вступил новый участник по имени ${name}${username ? ` (${username})` : ""}. ${isReturning ? "Этот человек уже общался с тобой раньше — поприветствуй как старого знакомого." : "Это новый человек в чате."}`);
 
       const prompt = isReturning
         ? `[${name} только что вошёл в групповой чат. Поприветствуй его тепло, как будто уже знаешь. Коротко, живо, без официоза.]`
@@ -2398,7 +2413,7 @@ bot.on("sticker", async (msg) => {
   const resp = await withRetry(() => groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: [
-      { role: "system", content: SYSTEM_PROMPT_BASE + memory },
+      { role: "system", content: systemPromptFor(msg.from.id, memory) },
       ...history,
       { role: "user", content: `[стикер ${sticker.emoji ?? ""}${sticker.set_name ? ` из набора "${sticker.set_name}"` : ""}]` },
     ],
@@ -2540,6 +2555,10 @@ bot.on("message", async (msg) => {
   const text = msg.text;
   const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
 
+  if (isGroup && isWhisperCommand(text)) {
+    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+  }
+
   await trackUser(from);
   await trackBotChat(bot, msg);
 
@@ -2568,6 +2587,7 @@ bot.on("message", async (msg) => {
       );
       return;
     }
+    if (isWhisperCommand(text)) return;
 
     // Custom group commands (triggers set by admins) — always handled
     const handled = await handleGroupCommand(bot, msg, text).catch(() => false);

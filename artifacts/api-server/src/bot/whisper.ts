@@ -39,6 +39,23 @@ export interface WhisperIntent {
 // Match "шёпот" OR "шепот" (both spellings), case-insensitive
 // ш[её]пот: brackets match either ё or е
 const WHISPER_RE = /^ш[её]пот\s*/i;
+const CALLBACK_ALERT_LIMIT = 190;
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function truncateAlert(text: string): string {
+  if (text.length <= CALLBACK_ALERT_LIMIT) return text;
+  return `${text.slice(0, CALLBACK_ALERT_LIMIT - 1)}…`;
+}
+
+export function isWhisperCommand(text: string): boolean {
+  return /^ш[её]пот(?:\s|$)/i.test(text.trim());
+}
 
 export function detectWhisper(msg: TelegramBot.Message): WhisperIntent | null {
   const text = msg.text ?? "";
@@ -150,8 +167,8 @@ export async function handleWhisper(
 
   await bot.sendMessage(
     chatId,
-    `🔇 <b>${senderName}</b> шепчет что-то <b>${targetName}</b>\n` +
-    `<i>Только ${targetName} может прочитать. Кнопка активна 10 минут.</i>`,
+    `🔇 <b>${escapeHtml(senderName)}</b> шепчет что-то <b>${escapeHtml(targetName)}</b>\n` +
+    `<i>Только ${escapeHtml(targetName)} может прочитать. Кнопка активна 10 минут.</i>`,
     {
       parse_mode: "HTML",
       reply_markup: {
@@ -200,11 +217,26 @@ export async function handleWhisperCallback(
     return;
   }
 
-  // Correct user — reveal via popup
-  await bot.answerCallbackQuery(query.id, {
-    text: `🔇 ${whisper.senderName} шепчет:\n\n${whisper.text}`,
-    show_alert: true,
-  });
+  const revealText = `🔇 ${whisper.senderName} шепчет:\n\n${whisper.text}`;
+  if (revealText.length <= CALLBACK_ALERT_LIMIT) {
+    await bot.answerCallbackQuery(query.id, {
+      text: revealText,
+      show_alert: true,
+    });
+  } else {
+    try {
+      await bot.sendMessage(user.id, revealText);
+      await bot.answerCallbackQuery(query.id, {
+        text: "🔇 шёпот отправил тебе в личку",
+        show_alert: true,
+      });
+    } catch {
+      await bot.answerCallbackQuery(query.id, {
+        text: truncateAlert(revealText),
+        show_alert: true,
+      });
+    }
+  }
 
   // Single-use: remove after reading
   whispers.delete(whisperId);
@@ -212,8 +244,8 @@ export async function handleWhisperCallback(
   // Update the group message to show "read" state
   if (query.message) {
     await bot.editMessageText(
-      `🔇 <b>${whisper.senderName}</b> прошептал что-то <b>${whisper.targetName}</b>\n` +
-      `<i>✅ Прочитано ${user.username ? `@${user.username}` : user.first_name}</i>`,
+      `🔇 <b>${escapeHtml(whisper.senderName)}</b> прошептал что-то <b>${escapeHtml(whisper.targetName)}</b>\n` +
+      `<i>✅ Прочитано ${escapeHtml(user.username ? `@${user.username}` : user.first_name)}</i>`,
       {
         chat_id: query.message.chat.id,
         message_id: query.message.message_id,
