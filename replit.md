@@ -60,9 +60,44 @@ pnpm workspace monorepo using TypeScript. Telegram AI bot "Сэм (Sam)" — a 2
 - Username: @Wuixoll, ID: 8188102679
 - Access: /danni, /status, /broadcast
 
+## Python Failover Bot (`bot/`)
+
+Standalone Python Telegram bot with intelligent Gemini↔Grok API failover.
+
+### Run
+```bash
+cd bot && python3 main.py
+```
+
+### Architecture
+- `bot/api_manager.py` — core failover engine (circuit breaker, health checks, smart routing)
+- `bot/config.py` — env config loader
+- `bot/handlers/text.py` — text, translate, summarize, code gen, URL analysis
+- `bot/handlers/voice.py` — STT (Gemini/Groq Whisper) + TTS (gTTS)
+- `bot/handlers/image.py` — image analysis, OCR
+- `bot/handlers/music.py` — song identification by lyrics/description
+- `bot/utils/cache.py` — in-memory LRU cache (TTL 1h)
+- `bot/utils/logger.py` — logging + Telegram admin alerts
+- `bot/utils/retry.py` — exponential backoff with jitter
+
+### Failover Logic
+- Priority: Gemini (primary) → Grok (fallback)
+- Circuit breaker: 3 failures → 60s block → auto-recover
+- Health checks every 30s
+- Smart routing: 70/30 load split; quality tasks → Gemini Pro; speed → faster API
+- Admin alert after 5min downtime
+
+### Python Dependencies
+```
+python-telegram-bot==21.10, google-generativeai==0.8.5, openai==1.82.0, groq==0.26.0, gTTS==2.5.4
+```
+
 ## Environment Variables
-- `TELEGRAM_BOT_TOKEN` — required
-- `GROQ_API_KEY` — required
-- `ELEVENLABS_API_KEY` — optional (TTS; falls back to no voice if missing)
+- `TELEGRAM_BOT_TOKEN` — required (both bots)
+- `GROQ_API_KEY` — required (TS bot + Python STT fallback)
+- `GEMINI_API_KEY` — required for Python bot (primary AI)
+- `GROK_API_KEY` — required for Python bot (fallback AI)
+- `ADMIN_TELEGRAM_ID` — optional (Python bot: downtime alerts)
+- `ELEVENLABS_API_KEY` — optional (TS TTS; falls back to no voice if missing)
 - `SESSION_SECRET` — Express session
 - `DATABASE_URL` — PostgreSQL connection
