@@ -28,6 +28,8 @@ pnpm workspace monorepo using TypeScript. Telegram AI bot "Сэм (Sam)" — a 2
 ### Modules
 - `bot/music.ts` — YouTube search (Invidious API), lyrics (some-random-api)
 - `bot/games.ts` — Duel, Marriage, Mafia (in-memory state + DB)
+- `bot/chat_health.ts` — sentiment tracking, DM offended users, DM admins on conflict, `/chathealth` report
+- `bot/interactives.ts` — random polls, would-you-rather, word games, AI trivia for activity boost
 - `bot/admin.ts` — Group admin: ban/mute/warn/rules/welcome/custom commands
 - `bot/danni.ts` — Analytics: /danni, /danni_chat, /export_data (owner-only)
 - `bot/broadcast.ts` — Broadcast system (owner-only)

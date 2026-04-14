@@ -46,6 +46,11 @@ import {
   touchDirectConvo, clearDirectConvo, isDirectConvo, recordMsg,
   markNewMember, recordBotActivity, recordChatActivity, getQuietChats,
 } from "./group_guard";
+import {
+  dmOffendedUser, dmAdmins, getChatHealthReport,
+  recordSentimentForHealth, getRecentSentiments,
+} from "./chat_health";
+import { startRandomInteractive } from "./interactives";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
@@ -111,10 +116,28 @@ const chatMsgHistory = new Map<number, MsgRecord[]>();
 
 function recordForConflict(chatId: number, userId: number, text: string): void {
   const history = chatMsgHistory.get(chatId) ?? [];
-  history.push({ userId, text, sentiment: analyzeSentiment(text), ts: Date.now() });
+  const sentiment = analyzeSentiment(text);
+  history.push({ userId, text, sentiment, ts: Date.now() });
   // Keep last 30
   if (history.length > 30) history.splice(0, history.length - 30);
   chatMsgHistory.set(chatId, history);
+  // Feed into chat health tracker
+  recordSentimentForHealth(chatId, sentiment);
+}
+
+// Find the most-likely victim (participant ≠ aggressor with most messages in the window)
+function findVictimId(messages: MsgRecord[], aggressorId: number): number | undefined {
+  const counts = new Map<number, number>();
+  for (const m of messages) {
+    if (m.userId === aggressorId) continue;
+    counts.set(m.userId, (counts.get(m.userId) ?? 0) + 1);
+  }
+  let victimId: number | undefined;
+  let maxCount = 0;
+  for (const [uid, cnt] of counts.entries()) {
+    if (cnt > maxCount) { maxCount = cnt; victimId = uid; }
+  }
+  return victimId;
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -695,21 +718,30 @@ async function runActivityBoost(): Promise<void> {
     const targetId = quietIds[Math.floor(Math.random() * quietIds.length)];
     if (!targetId) return;
 
-    const resp = await withRetry(() => groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT_BASE },
-        { role: "user", content: `[Чат затих. Напиши короткое живое сообщение от себя — вопрос, наблюдение, интересная тема или просто что-то, что разожжёт разговор. Не объявляй что ты "поднимаешь активность". Пиши как обычный участник. Максимум 1-2 предложения.]` },
-      ],
-      max_tokens: 100,
-      temperature: 1.0,
-    }), { label: "activity boost" });
+    // 55% chance — send an interactive (poll, would you rather, word game, trivia)
+    // 45% chance — Sam writes a proactive message in character
+    const useInteractive = Math.random() < 0.55;
 
-    const boostMsg = resp.choices[0]?.message?.content?.trim();
-    if (boostMsg) {
-      await bot.sendMessage(targetId, boostMsg).catch(() => {});
-      recordBotActivity(targetId);
-      logger.info({ chatId: targetId }, "Activity boost sent");
+    if (useInteractive) {
+      const sent = await startRandomInteractive(bot, groq, SYSTEM_PROMPT_BASE, targetId);
+      if (sent) logger.info({ chatId: targetId, mode: "interactive" }, "Activity boost sent");
+    } else {
+      const resp = await withRetry(() => groq.chat.completions.create({
+        model: "llama-3.3-70b-versatile",
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT_BASE },
+          { role: "user", content: `[Чат затих. Напиши короткое живое сообщение от себя — вопрос, наблюдение, интересная тема или просто что-то, что разожжёт разговор. Не объявляй что ты "поднимаешь активность". Пиши как обычный участник. Максимум 1-2 предложения.]` },
+        ],
+        max_tokens: 100,
+        temperature: 1.0,
+      }), { label: "activity boost" });
+
+      const boostMsg = resp.choices[0]?.message?.content?.trim();
+      if (boostMsg) {
+        await bot.sendMessage(targetId, boostMsg).catch(() => {});
+        recordBotActivity(targetId);
+        logger.info({ chatId: targetId, mode: "text" }, "Activity boost sent");
+      }
     }
   } catch (err) {
     logger.warn({ err }, "Activity boost failed (non-critical)");
@@ -1368,6 +1400,24 @@ async function runAutoModeration(msg: TelegramBot.Message): Promise<boolean> {
     const { isConflict, aggressorId } = detectConflictContext(updated);
     if (isConflict && aggressorId) {
       const doAutoban = config?.autobanEnabled ?? false;
+
+      // Resolve aggressor & victim names for DMs
+      const [aggressorRow] = await db.select().from(telegramUsersTable)
+        .where(eq(telegramUsersTable.userId, aggressorId)).catch(() => []);
+      const aggressorName = aggressorRow?.username
+        ? `@${aggressorRow.username}` : (aggressorRow?.firstName ?? `id${aggressorId}`);
+
+      const victimId = findVictimId(updated, aggressorId);
+      let victimName: string | null = null;
+      if (victimId) {
+        const [victimRow] = await db.select().from(telegramUsersTable)
+          .where(eq(telegramUsersTable.userId, victimId)).catch(() => []);
+        victimName = victimRow?.username
+          ? `@${victimRow.username}` : (victimRow?.firstName ?? null);
+      }
+
+      const chatTitle = msg.chat.title ?? "чат";
+
       try {
         if (doAutoban) {
           await bot.banChatMember(chatId, aggressorId);
@@ -1378,7 +1428,8 @@ async function runAutoModeration(msg: TelegramBot.Message): Promise<boolean> {
           });
         }
         chatMsgHistory.delete(chatId);
-        // Sam reacts to the conflict in character — no sterile system messages
+
+        // 1. Sam reacts in character in the group
         try {
           const conflictReply = await withRetry(() => groq.chat.completions.create({
             model: "llama-3.3-70b-versatile",
@@ -1398,6 +1449,15 @@ async function runAutoModeration(msg: TelegramBot.Message): Promise<boolean> {
             recordBotActivity(chatId);
           }
         } catch { /* non-critical */ }
+
+        // 2. DM the victim with support (fire-and-forget)
+        if (victimId && victimName) {
+          void dmOffendedUser(bot, groq, SYSTEM_PROMPT_BASE, chatTitle, victimId, victimName, aggressorName);
+        }
+
+        // 3. DM admins with conflict report (fire-and-forget)
+        void dmAdmins(bot, chatId, chatTitle, aggressorName, victimName, doAutoban ? "ban" : "mute_30m");
+
         return true;
       } catch { /* Insufficient permissions */ }
       void minSent;
@@ -1816,6 +1876,65 @@ bot.onText(/^\/rules/, async (msg) => { await handleRules(bot, msg); });
 bot.onText(/^\/setrules\s*(.+)?/, async (msg, m) => { await handleSetRules(bot, msg, m?.[1] ?? ""); });
 bot.onText(/^\/setwelcome\s*(.+)?/, async (msg, m) => { await handleSetWelcome(bot, msg, m?.[1] ?? ""); });
 bot.onText(/^\/chatstats/, async (msg) => { await handleGroupStats(bot, msg); });
+
+// ── /chathealth — chat atmosphere & member report ──────────────────────────
+bot.onText(/^\/chathealth/, async (msg) => {
+  const chatId = msg.chat.id;
+  const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+  if (!isGroup) {
+    await bot.sendMessage(chatId, "эта команда только для групп", { reply_to_message_id: msg.message_id });
+    return;
+  }
+  const sentiments = getRecentSentiments(chatId);
+  const report = await getChatHealthReport(bot, chatId, sentiments);
+  await bot.sendMessage(chatId, report, { parse_mode: "HTML" }).catch(() => {});
+});
+
+// ── /members — member count + admin list ──────────────────────────────────
+bot.onText(/^\/members/, async (msg) => {
+  const chatId = msg.chat.id;
+  const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+  if (!isGroup) {
+    await bot.sendMessage(chatId, "эта команда только для групп", { reply_to_message_id: msg.message_id });
+    return;
+  }
+  try {
+    const [count, admins] = await Promise.all([
+      bot.getChatMembersCount(chatId).catch(() => 0),
+      bot.getChatAdministrators(chatId).catch(() => [] as TelegramBot.ChatMember[]),
+    ]);
+    const humanAdmins = (admins as TelegramBot.ChatMember[]).filter(a => !a.user.is_bot);
+    const adminList = humanAdmins.length > 0
+      ? humanAdmins.map(a => {
+          const name = a.user.username ? `@${a.user.username}` : (a.user.first_name ?? "—");
+          const role = a.status === "creator" ? " 👑" : "";
+          return `• ${name}${role}`;
+        }).join("\n")
+      : "• нет данных";
+
+    const text = [
+      `👥 <b>Участники чата</b>`,
+      ``,
+      `Всего: <b>${count}</b>`,
+      `Администраторов: <b>${humanAdmins.length}</b>`,
+      ``,
+      `<b>Список администраторов:</b>`,
+      adminList,
+    ].join("\n");
+
+    await bot.sendMessage(chatId, text, { parse_mode: "HTML" });
+  } catch {
+    await bot.sendMessage(chatId, "не удалось получить данные об участниках").catch(() => {});
+  }
+});
+
+// ── /interactive — manually trigger a random interactive ──────────────────
+bot.onText(/^\/interactive/, async (msg) => {
+  const chatId = msg.chat.id;
+  const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+  if (!isGroup) return;
+  await startRandomInteractive(bot, groq, SYSTEM_PROMPT_BASE, chatId);
+});
 bot.onText(/^\/cmds/, async (msg) => { await handleListCmds(bot, msg); });
 
 bot.onText(/^\/addcmd\s+(\S+)\s+(.+)/, async (msg, m) => {
