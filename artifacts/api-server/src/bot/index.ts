@@ -41,6 +41,10 @@ import {
   executeBroadcast, trackBotChat,
 } from "./broadcast";
 import { startMonitor, getLastHealthReport } from "./monitor";
+import {
+  shouldGroupReply, rateLimitAllowed, incrementRate,
+  touchDirectConvo, clearDirectConvo, isDirectConvo, recordMsg,
+} from "./group_guard";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
@@ -56,6 +60,15 @@ const BOT_POLLING = process.env["BOT_POLLING"] === "true";
 const bot = new TelegramBot(token, { polling: BOT_POLLING });
 const groq = new Groq({ apiKey: groqKey });
 const eleven = elevenKey ? new ElevenLabsClient({ apiKey: elevenKey }) : null;
+
+// Bot identity — resolved async once on startup
+let BOT_ID = 0;
+let BOT_USERNAME = "sam_bot";
+bot.getMe().then(me => {
+  BOT_ID = me.id;
+  BOT_USERNAME = me.username ?? "sam_bot";
+  logger.info({ BOT_ID, BOT_USERNAME }, "Bot identity resolved");
+}).catch(() => {});
 
 // ElevenLabs young male Russian-friendly voice
 const ELEVEN_VOICE_ID = "pNInz6obpgDQGcFmaJgB"; // Adam
@@ -1835,8 +1848,61 @@ bot.onText(/^\/mafiaend/, async (msg) => { await handleMafiaEnd(bot, msg); });
 // ─── New member handler ───────────────────────────────────────────────────────
 
 bot.on("new_chat_members", async (msg) => {
-  await handleNewMember(bot, msg);
   await trackBotChat(bot, msg);
+
+  const chatId = msg.chat.id;
+  const newMembers = msg.new_chat_members ?? [];
+
+  for (const member of newMembers) {
+    if (member.is_bot) continue;
+
+    // Track the user
+    await trackUser(member).catch(() => {});
+
+    const name = member.first_name ?? member.username ?? "новенький";
+    const username = member.username ? `@${member.username}` : null;
+
+    // 1. Send the admin-configured welcome message if exists
+    await handleNewMember(bot, msg).catch(() => {});
+
+    // 2. Always send a unique AI-generated personal greeting
+    try {
+      const memory = await loadMemory(member.id).catch(() => "");
+      const isReturning = memory.length > 10;
+
+      const systemCtx = SYSTEM_PROMPT_BASE + `\n\nТы сейчас в группе. В чат только что вступил новый участник по имени ${name}${username ? ` (${username})` : ""}. ${isReturning ? "Этот человек уже общался с тобой раньше — поприветствуй как старого знакомого." : "Это новый человек в чате."}`;
+
+      const prompt = isReturning
+        ? `[${name} только что вошёл в групповой чат. Поприветствуй его тепло, как будто уже знаешь. Коротко, живо, без официоза.]`
+        : `[${name} только что вступил в чат. Напиши уникальное персональное приветствие: тепло, коротко, по-человечески. Предложи освоиться, скажи что готов помочь и пообщаться. Не копируй шаблонные фразы.]`;
+
+      const resp = await withRetry(() => groq.chat.completions.create({
+        model: "llama-3.3-70b-versatile",
+        messages: [
+          { role: "system", content: systemCtx },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 150,
+        temperature: 0.9,
+      }), { label: "welcome" });
+
+      const greeting = resp.choices[0]?.message?.content?.trim();
+      if (greeting) {
+        await bot.sendMessage(chatId, greeting, {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "👋 Познакомиться с ботом", callback_data: "welcome_pm" },
+            ]],
+          },
+        }).catch(() => {});
+      }
+    } catch (err) {
+      logger.warn({ err }, "Welcome AI greeting failed");
+      // Fallback simple greeting
+      const fallback = `${name}, привет) добро пожаловать в чат, освойся`;
+      await bot.sendMessage(chatId, fallback).catch(() => {});
+    }
+  }
 });
 
 // ─── Sticker handler ──────────────────────────────────────────────────────────
@@ -1997,6 +2063,7 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const from = msg.from;
   const text = msg.text;
+  const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
 
   await trackUser(from);
   await trackBotChat(bot, msg);
@@ -2005,32 +2072,64 @@ bot.on("message", async (msg) => {
   logMessage(chatId, from.id, from.username, text);
   updateUserAnalytics(chatId, from.id, analyzeSentiment(text));
 
-  // Broadcast: if owner is sending broadcast text
+  // Broadcast mode
   if (isOwner(from.id) && hasPendingBroadcast(from.id)) {
     await executeBroadcast(bot, chatId, from.id, text);
     return;
   }
 
-  // Check custom group commands first
-  const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+  // ── GROUP chat logic ────────────────────────────────────────────────────────
   if (isGroup) {
+    // Always record message for conflict detection and dialogue tracking
+    recordMsg(chatId, from.id);
+    recordForConflict(chatId, from.id, text);
+
+    // Custom group commands (triggers set by admins) — always handled
     const handled = await handleGroupCommand(bot, msg, text).catch(() => false);
     if (handled) return;
 
-    // Run auto-moderation
+    // Auto-moderation (flood, spam, conflict) — always runs, takes priority
     const blocked = await runAutoModeration(msg).catch(() => false);
-    if (blocked) return;
+    if (blocked) {
+      // If a user was in a direct convo, end it when they get blocked
+      clearDirectConvo(chatId);
+      return;
+    }
 
-    // Record for conflict detection
-    recordForConflict(chatId, from.id, text);
+    // Decide whether to respond
+    const reason = shouldGroupReply(msg, BOT_ID, BOT_USERNAME);
+
+    if (reason === "skip") return; // Stay silent
+
+    // Rate limit applies to questions but NOT to direct mentions / active convos
+    const freeOfRateLimit = reason === "direct_mention" || reason === "reply_to_bot" || reason === "direct_convo";
+    if (!freeOfRateLimit && !rateLimitAllowed(chatId)) return;
+
+    try {
+      const reply = await chat(from.id, chatId, text);
+      if (reply?.trim()) {
+        await sendWithTyping(chatId, reply);
+        incrementRate(chatId);
+        // Mark as direct conversation so next messages from this user get priority
+        if (reason === "direct_mention" || reason === "reply_to_bot") {
+          touchDirectConvo(chatId, from.id);
+        } else if (reason === "direct_convo") {
+          touchDirectConvo(chatId, from.id); // refresh timeout
+        }
+      }
+    } catch (err) {
+      logger.error({ err }, "Group chat error");
+    }
+    return;
   }
 
+  // ── PRIVATE chat — always respond ─────────────────────────────────────────
   try {
     const reply = await chat(from.id, chatId, text);
     void detectAndScheduleFollowUp(from.id, text);
     if (reply?.trim()) await sendWithTyping(chatId, reply);
   } catch (err) {
-    logger.error({ err }, "Chat error");
+    logger.error({ err }, "Private chat error");
     await bot.sendMessage(chatId, "что-то пошло не так, попробуй ещё раз").catch(() => {});
   }
 });
