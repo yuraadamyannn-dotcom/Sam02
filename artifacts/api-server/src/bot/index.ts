@@ -171,6 +171,46 @@ bot.onText = ((regexp, callback) => {
   });
 }) as TelegramBot["onText"];
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function normalizeShadowText(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, 3200);
+}
+
+bot.on("inline_query", async (query) => {
+  const shadowText = normalizeShadowText(query.query ?? "");
+  if (!shadowText) {
+    await bot.answerInlineQuery(query.id, [], {
+      cache_time: 0,
+      is_personal: true,
+    });
+    return;
+  }
+
+  const result: TelegramBot.InlineQueryResultArticle = {
+    type: "article",
+    id: `shadow-${query.id}`.slice(0, 64),
+    title: `🌑 Древние духи гласят: ${shadowText}`,
+    description: "Отправить анонимное послание от лица тени",
+    input_message_content: {
+      message_text: `🌑 <b>Древние духи гласят:</b> ${escapeHtml(shadowText)}`,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    },
+  };
+
+  await bot.answerInlineQuery(query.id, [result], {
+    cache_time: 0,
+    is_personal: true,
+  });
+});
+
 // ─── Conversation history ─────────────────────────────────────────────────────
 // Key: `${chatId}:${userId}` for per-user per-chat context
 
