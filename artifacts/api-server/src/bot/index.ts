@@ -318,25 +318,29 @@ const SYSTEM_PROMPT_BASE = `Ты — Сэм (Sam). Тебе 17 лет. Ты жи
 Если спрашивают что-то фактическое — отвечаешь уверенно и по делу.
 Если спрашивают про администрирование чата — объясняешь чётко.
 
-ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ — ПРАВИЛА:
-Когда пользователь просит нарисовать, сгенерировать, показать картинку, арт, фото — используй теги:
+ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ — СТРОГИЕ ПРАВИЛА:
 
-[ФОТО:prompt] — для любой картинки/фото/иллюстрации. Prompt ВСЕГДА на английском, развёрнутый, в стиле Stable Diffusion.
-Примеры хорошего промта: "beautiful anime girl with silver hair in kimono, cherry blossom background, sunset lighting, highly detailed"
-                           "cyberpunk city at night, neon signs, rain reflections, cinematic perspective"
-                           "fantasy wolf in enchanted forest, glowing eyes, moonlight, ethereal atmosphere"
+[ФОТО:prompt] — ТОЛЬКО когда пользователь ЯВНО просит: "нарисуй", "сгенерируй", "покажи картинку", "draw", "создай арт/изображение".
+НЕ используй этот тег в обычном разговоре, при описании чего-либо, при воспоминаниях, при эмоциях!
 
-[АРТЫ:стиль|prompt] — когда просят в стиле конкретного художника или арт-направления.
-Стили: nixeu, wlop, artgerm, greg rutkowski, ghibli, cyberpunk, watercolor, dark fantasy, realistic, manga и др.
-Пример: [АРТЫ:nixeu|dark fantasy warrior woman, glowing sword, dramatic lighting]
+[АРТЫ:стиль|prompt] — только если просят арт в конкретном стиле художника.
+Стили: nixeu, wlop, artgerm, ghibli, cyberpunk, watercolor, dark fantasy, manga, greg rutkowski.
 
-[МЕМ:тема] — только если прямо просят мем
-[СТИКЕР] — как редкая эмоциональная реакция
+Prompt для ФОТО и АРТЫ:
+- ВСЕГДА на английском
+- Развёрнутый, детальный: персонаж, обстановка, освещение, настроение, художественный стиль
+- Для аниме добавляй: anime style, 2d illustration, vibrant colors, cel shading, studio quality
+- Для реализма: photorealistic, cinematic lighting, 8k, professional photography
+
+Примеры:
+  Запрос "нарисуй закат" → [ФОТО:breathtaking anime sunset over ocean, orange and pink sky, silhouette of trees, peaceful atmosphere, studio quality]
+  Запрос "арт в стиле гибли" → [АРТЫ:ghibli|young girl in magical meadow, warm sunlight, soft watercolor style, enchanted atmosphere]
+
+[МЕМ:тема] — только если явно просят мем
+[СТИКЕР] — как редкая живая реакция
 [ГОЛОС] — только если просят голосовое
 
-ВАЖНО: Промт для ФОТО и АРТЫ всегда на английском, детальный — это напрямую влияет на качество изображения.
-Если пользователь описал что-то на русском — переведи и расширь в prompt.
-НЕ добавляй медиатеги в обычный диалог без запроса.`;
+ЗАПРЕЩЕНО: вставлять медиатеги в обычный диалог. Только по прямому запросу на генерацию.`;
 
 function ownerContext(userId: number): string {
   if (!isOwner(userId)) return "";
@@ -395,19 +399,49 @@ function enhancePrompt(prompt: string): string {
   return `${prompt.trim()}, ${SD_POSITIVE_SUFFIX}`;
 }
 
-function pollinationsUrl(prompt: string, width = 1024, height = 1024): string {
+// Available Pollinations models:
+// flux         — general purpose, highest quality
+// flux-anime   — fine-tuned for anime / waifu art
+// flux-realism — photorealistic images
+// turbo        — SDXL fast
+type PollinationsModel = "flux" | "flux-anime" | "flux-realism" | "turbo";
+
+function pollinationsUrl(
+  prompt: string,
+  model: PollinationsModel = "flux",
+  width = 1024,
+  height = 1024,
+): string {
   const seed = Math.floor(Math.random() * 999999);
-  const base = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
+  // Keep prompt under 400 chars to stay well within URL limits
+  const safePrompt = prompt.length > 400 ? prompt.slice(0, 400) : prompt;
+  const base = `https://image.pollinations.ai/prompt/${encodeURIComponent(safePrompt)}`;
   const params = new URLSearchParams({
     width:    String(width),
     height:   String(height),
-    model:    "flux",
+    model,
     seed:     String(seed),
     nologo:   "true",
     enhance:  "true",
     negative: SD_NEGATIVE,
   });
   return `${base}?${params.toString()}`;
+}
+
+/** Detects anime/waifu-style content in prompt to choose the best model */
+const ANIME_PROMPT_RE =
+  /\b(anime|waifu|manga|chibi|kawaii|neko|moe|isekai|shonen|shojo|ghibli|naruto|sakura|2d\s*illus|cel.shad|bishojo|bishonen)\b/i;
+
+function isAnimePrompt(prompt: string): boolean {
+  return ANIME_PROMPT_RE.test(prompt);
+}
+
+/** Words in user's message that indicate an explicit image generation request */
+const IMAGE_REQUEST_RE =
+  /нарисуй|нарисован|сгенерир|покажи\s*(фото|арт|картин|изображ|рисун)|draw|generate\s*image|арт\s*(в|на|по)|картинк|фоточк|изображени|рисунок|пришли\s*фото|генерац|создай\s*(арт|изображ|картин)/i;
+
+function userWantsImage(text: string): boolean {
+  return IMAGE_REQUEST_RE.test(text);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -468,14 +502,21 @@ function extractUserFromText(text: string, msg: TelegramBot.Message): TelegramBo
 
 // ─── Image generation ─────────────────────────────────────────────────────────
 
-async function generateAndSendImage(chatId: number, prompt: string, caption?: string): Promise<void> {
+async function generateAndSendImage(
+  chatId: number,
+  prompt: string,
+  caption?: string,
+  forceModel?: PollinationsModel,
+): Promise<void> {
   try {
     await bot.sendChatAction(chatId, "upload_photo");
     const enhanced = enhancePrompt(prompt);
-    const url = pollinationsUrl(enhanced);
+    const model: PollinationsModel = forceModel ?? (isAnimePrompt(prompt) ? "flux-anime" : "flux");
+    const url = pollinationsUrl(enhanced, model);
+    logger.info({ model, prompt: prompt.slice(0, 80) }, "Generating image via Pollinations");
     await withTimeout(
-      bot.sendPhoto(chatId, url, caption ? { caption } : undefined),
-      90000, "image send",
+      bot.sendPhoto(chatId, url, caption ? { caption, parse_mode: "HTML" } : undefined),
+      120_000, "image send",
     );
   } catch (err) {
     logger.error({ err }, "Image generation failed");
@@ -487,9 +528,14 @@ async function generateArtInStyle(chatId: number, style: string, subject: string
   try {
     await bot.sendChatAction(chatId, "upload_photo");
     const artistStyle = resolveArtistStyle(style);
-    const fullPrompt = enhancePrompt(`${subject}, ${artistStyle}`);
-    const url = pollinationsUrl(fullPrompt);
-    await withTimeout(bot.sendPhoto(chatId, url), 90000, "art send");
+    const combined = `${subject}, ${artistStyle}`;
+    const fullPrompt = enhancePrompt(combined);
+    // Anime-style artist styles → use flux-anime model
+    const animeArtists = /nixeu|wlop|artgerm|ghibli|anime|manga|chibi|kawaii/i;
+    const model: PollinationsModel = animeArtists.test(style) ? "flux-anime" : "flux";
+    const url = pollinationsUrl(fullPrompt, model);
+    logger.info({ model, style, subject: subject.slice(0, 50) }, "Generating art via Pollinations");
+    await withTimeout(bot.sendPhoto(chatId, url), 120_000, "art send");
   } catch (err) {
     logger.error({ err }, "Art generation failed");
     await bot.sendMessage(chatId, "не получилось сгенерить, попробуй другой промт").catch(() => {});
@@ -1017,7 +1063,6 @@ async function chat(userId: number, chatId: number, userText: string): Promise<s
     );
   } catch (err) {
     logger.error({ err }, "AI router: all providers failed");
-    // Return in-character fallback — never show a raw error to the user
     const fallbacks = [
       "голова немного гудит, напиши чуть позже",
       "щас не могу думать нормально, попробуй через минуту",
@@ -1026,7 +1071,17 @@ async function chat(userId: number, chatId: number, userText: string): Promise<s
     ];
     return fallbacks[Math.floor(Math.random() * fallbacks.length)]!;
   }
-  const clean = await processTagsAndSend(chatId, rawReply);
+
+  // Guard: strip photo/art tags if user didn't explicitly ask for an image.
+  // This prevents the AI from spontaneously generating images mid-conversation.
+  let guardedReply = rawReply;
+  if (!userWantsImage(userText)) {
+    guardedReply = rawReply
+      .replace(/\[ФОТО:[^\]]*\]/gi, "")
+      .replace(/\[АРТЫ:[^\]]*\]/gi, "");
+  }
+
+  const clean = await processTagsAndSend(chatId, guardedReply);
   const finalText = clean || rawReply.replace(/\[.*?\]/g, "").trim() || "...";
 
   history.push({ role: "assistant", content: finalText });
@@ -1866,9 +1921,9 @@ bot.on("callback_query", async (query) => {
       } catch (err) {
         if (loadingMsg) await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
         logger.error({ err }, "Waifu callback generation failed");
-        // Fallback to Pollinations
+        // Fallback to Pollinations flux-anime
         try {
-          const url = pollinationsUrl(enhancePrompt(`${finalPrompt}, anime style, 2d illustration, vibrant colors`));
+          const url = pollinationsUrl(enhancePrompt(`${finalPrompt}, anime style, 2d illustration, vibrant colors`), "flux-anime", 832, 1216);
           await bot.sendPhoto(chatId!, url, {
             caption: `🌸 <i>${finalPrompt.slice(0, 100)}</i>`,
             parse_mode: "HTML",
@@ -1894,7 +1949,8 @@ bot.on("callback_query", async (query) => {
       const loading = await bot.sendMessage(chatId, "🎨 Генерирую…").catch(() => null);
       try {
         await bot.sendChatAction(chatId, "upload_photo");
-        const url = pollinationsUrl(enhancePrompt(prompt));
+        const drawModel: PollinationsModel = isAnimePrompt(prompt) ? "flux-anime" : "flux";
+        const url = pollinationsUrl(enhancePrompt(prompt), drawModel);
         await withTimeout(
           bot.sendPhoto(chatId, url, {
             caption: `🖼 <i>${prompt.slice(0, 100)}${prompt.length > 100 ? "…" : ""}</i>`,
@@ -1905,7 +1961,7 @@ bot.on("callback_query", async (query) => {
               ]],
             },
           }),
-          90000, "draw_again",
+          120_000, "draw_again",
         );
         if (loading) await bot.deleteMessage(chatId, loading.message_id).catch(() => {});
       } catch (err) {
@@ -2172,7 +2228,10 @@ bot.onText(/^\/(?:draw|нарисуй|арт|art|gen|image)(?:@\w+)?(?:\s+([\s\S
   try {
     await bot.sendChatAction(chatId, "upload_photo");
     const enhanced = enhancePrompt(finalPrompt);
-    const url = pollinationsUrl(enhanced);
+    // Auto-select model: flux-anime for anime content, flux for everything else
+    const model: PollinationsModel = isAnimePrompt(finalPrompt) ? "flux-anime" : "flux";
+    const url = pollinationsUrl(enhanced, model);
+    logger.info({ model, prompt: finalPrompt.slice(0, 80) }, "/draw generation");
 
     const shortPrompt = finalPrompt.slice(0, 100) + (finalPrompt.length > 100 ? "…" : "");
     await withTimeout(
@@ -2186,13 +2245,13 @@ bot.onText(/^\/(?:draw|нарисуй|арт|art|gen|image)(?:@\w+)?(?:\s+([\s\S
           ]],
         },
       }),
-      90000, "draw send",
+      120_000, "draw send",
     );
     await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
   } catch (err) {
     logger.error({ err }, "/draw generation failed");
     await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
-    await bot.sendMessage(chatId, "что-то пошло не так с генерацией, попробуй другой промт").catch(() => {});
+    await bot.sendMessage(chatId, "что-то пошло не так с генерацией, попробуй другой промт или подожди немного").catch(() => {});
   }
 });
 
@@ -2280,11 +2339,11 @@ bot.onText(/^\/waifu(?:\s+(.+))?$/, async (msg, match) => {
     }
 
     if (!photoSent) {
-      // Pollinations fallback with anime quality tags
+      // Pollinations fallback — use flux-anime model for waifu
       const animePrompt = enhancePrompt(
         `${finalPrompt}, anime style, 2d illustration, cel shading, vibrant colors, studio quality`,
       );
-      const url = pollinationsUrl(animePrompt);
+      const url = pollinationsUrl(animePrompt, "flux-anime", 832, 1216);
       await withTimeout(
         bot.sendPhoto(chatId, url, {
           caption:
