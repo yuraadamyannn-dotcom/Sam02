@@ -39,10 +39,9 @@ pnpm workspace monorepo using TypeScript. Telegram AI bot "Сэм (Sam)" — a 1
 - `bot/utils/sentiment.ts` — Russian sentiment analysis, conflict detection
 - `bot/utils/spam.ts` — Flood detection, spam filter
 
-### Inline Mode
-- Typing `@Wuixolllbot текст` in any Telegram chat returns one inline article: `🌑 Древние духи гласят: текст`.
-- Selecting the result sends the message from the bot as a "shadow" message; no slash command message is posted to the chat and the inline text is not stored in bot history.
-- Telegram inline mode must be enabled for the bot in BotFather for this UI to appear.
+### Shadow Messages
+- `/shadow текст` or `/s текст` — bot deletes the user's command message and sends `🌑 Древние духи гласят: текст` as its own message (true bot-sent shadow). Requires bot to have admin/delete-message permission in groups.
+- Inline mode (`@Wuixolllbot текст`) still works but sends via the user (Telegram limitation — inline results always come from the user "via @bot"). Use `/shadow` for true bot-sent messages.
 
 ### AI
 - **Chat**: Groq `llama-3.3-70b-versatile` (text, 30s timeout, 4 retries)

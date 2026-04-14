@@ -211,6 +211,24 @@ bot.on("inline_query", async (query) => {
   });
 });
 
+// ─── /shadow command — send message FROM THE BOT (true shadow) ────────────────
+// Usage: /shadow текст  or  /s текст
+// Bot deletes the user's command and sends the text as its own message.
+bot.onText(/^\/(?:shadow|s)(?:@\w+)?\s+([\s\S]+)$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const text = normalizeShadowText(match?.[1] ?? "");
+  if (!text) return;
+
+  // Delete user's command message silently (requires bot to be admin in groups)
+  await bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+
+  await bot.sendMessage(
+    chatId,
+    `🌑 <b>Древние духи гласят:</b> ${escapeHtml(text)}`,
+    { parse_mode: "HTML", disable_web_page_preview: true },
+  );
+});
+
 // ─── Conversation history ─────────────────────────────────────────────────────
 // Key: `${chatId}:${userId}` for per-user per-chat context
 
