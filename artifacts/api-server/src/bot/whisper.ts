@@ -36,40 +36,49 @@ export interface WhisperIntent {
   targetUsername?: string;
 }
 
+// Match "шёпот" OR "шепот" (both spellings), case-insensitive
+// ш[её]пот: brackets match either ё or е
+const WHISPER_RE = /^ш[её]пот\s*/i;
+
 export function detectWhisper(msg: TelegramBot.Message): WhisperIntent | null {
   const text = msg.text ?? "";
-  if (!text) return null;
-  const WHISPER_RE = /^шё?пот\b/i;
+  if (!text || !WHISPER_RE.test(text)) return null;
 
-  // Mode A: reply to someone's message — "шёпот текст"
-  if (WHISPER_RE.test(text) && msg.reply_to_message?.from) {
+  // Strip the trigger word to get the rest
+  const rest = text.replace(WHISPER_RE, "").trim();
+
+  // ── Mode A: reply to someone's message ────────────────────────────────────
+  // "шёпот текст" while replying to a message
+  if (msg.reply_to_message?.from) {
     const target = msg.reply_to_message.from;
     if (target.is_bot) return null;
-    const whisperText = text.replace(WHISPER_RE, "").trim();
-    if (!whisperText) return null;
-    return { whisperText, targetUser: target };
+    if (!rest) return null;
+    return { whisperText: rest, targetUser: target };
   }
 
-  // Mode B: "шёпот @username текст" or with text_mention entity
-  if (WHISPER_RE.test(text)) {
-    const rest = text.replace(WHISPER_RE, "").trim();
+  // ── Mode B: direct mention in the message ─────────────────────────────────
 
-    // Check for text_mention entity (users with no @username, linked by Telegram)
-    const textMentionEntity = msg.entities?.find(e => e.type === "text_mention" && e.user);
-    if (textMentionEntity?.user) {
-      const userEnd = textMentionEntity.offset + textMentionEntity.length;
-      const afterMention = text.slice(userEnd).trim();
-      if (afterMention) {
-        return { whisperText: afterMention, targetUser: textMentionEntity.user };
-      }
-      return null;
+  // B1: text_mention entity — user without @username (Telegram-linked display name)
+  // Format: "шёпот [Иван] текст"
+  const textMentionEntity = msg.entities?.find(
+    e => e.type === "text_mention" && e.user && !e.user.is_bot,
+  );
+  if (textMentionEntity?.user) {
+    // Extract text AFTER the mention entity (offsets are in UTF-16 code units)
+    const afterOffset = textMentionEntity.offset + textMentionEntity.length;
+    // text.slice works by character index; for most Russian text UTF-16 = chars
+    const afterMention = text.slice(afterOffset).trim();
+    if (afterMention) {
+      return { whisperText: afterMention, targetUser: textMentionEntity.user };
     }
+    return null;
+  }
 
-    // @username in text
-    const m = rest.match(/^@([a-zA-Z0-9_]{4,32})\s+(.+)$/s);
-    if (m) {
-      return { whisperText: m[2]!.trim(), targetUsername: m[1] };
-    }
+  // B2: @username mention in text — "шёпот @username текст"
+  // rest already has the trigger word stripped
+  const m = rest.match(/^@([a-zA-Z0-9_]{5,32})\s+([\s\S]+)$/);
+  if (m) {
+    return { whisperText: m[2]!.trim(), targetUsername: m[1] };
   }
 
   return null;
@@ -83,8 +92,13 @@ export async function handleWhisper(
   intent: WhisperIntent,
 ): Promise<void> {
   const chatId = msg.chat.id;
+  const msgId = msg.message_id;
   const from = msg.from!;
   const senderName = from.username ? `@${from.username}` : from.first_name;
+
+  // ── Delete the original message IMMEDIATELY (fire & forget) ───────────────
+  // Must happen first so the whisper text is never visible to others
+  bot.deleteMessage(chatId, msgId).catch(() => {});
 
   let targetId: number;
   let targetName: string;
@@ -95,16 +109,18 @@ export async function handleWhisper(
       ? `@${intent.targetUser.username}`
       : intent.targetUser.first_name;
   } else if (intent.targetUsername) {
-    // Look up in DB
+    // Resolve username → ID from DB
     const clean = intent.targetUsername.toLowerCase();
-    const [row] = await db.select().from(telegramUsersTable)
+    const rows = await db
+      .select()
+      .from(telegramUsersTable)
       .where(sql`LOWER(${telegramUsersTable.username}) = ${clean}`)
-      .catch(() => []);
+      .catch(() => [] as typeof telegramUsersTable.$inferSelect[]);
+    const row = rows[0];
     if (!row?.userId) {
       await bot.sendMessage(
         chatId,
-        `⚠️ Пользователь @${intent.targetUsername} не найден в базе.\nОн должен был написать в чат хотя бы раз.`,
-        { reply_to_message_id: msg.message_id },
+        `⚠️ Не нашёл @${intent.targetUsername} в базе — они должны были написать в чат хотя бы раз.`,
       );
       return;
     }
@@ -116,7 +132,7 @@ export async function handleWhisper(
 
   // Don't whisper to yourself
   if (targetId === from.id) {
-    await bot.sendMessage(chatId, "себе шепчешь? 😅", { reply_to_message_id: msg.message_id });
+    await bot.sendMessage(chatId, "себе шепчешь? 😅");
     return;
   }
 
@@ -132,12 +148,10 @@ export async function handleWhisper(
     expiresAt: Date.now() + 10 * 60 * 1000,
   });
 
-  // Delete original command message so the text stays secret
-  await bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-
   await bot.sendMessage(
     chatId,
-    `🔇 <b>${senderName}</b> шепчет что-то <b>${targetName}</b>\n<i>Только ${targetName} может прочитать это сообщение. Кнопка активна 10 минут.</i>`,
+    `🔇 <b>${senderName}</b> шепчет что-то <b>${targetName}</b>\n` +
+    `<i>Только ${targetName} может прочитать. Кнопка активна 10 минут.</i>`,
     {
       parse_mode: "HTML",
       reply_markup: {
@@ -158,7 +172,8 @@ export async function handleWhisperCallback(
   query: TelegramBot.CallbackQuery,
 ): Promise<void> {
   const user = query.from;
-  const [, whisperId] = (query.data ?? "").split(":");
+  const parts = (query.data ?? "").split(":");
+  const whisperId = parts.slice(1).join(":"); // safe even if id has colons
 
   if (!whisperId) {
     await bot.answerCallbackQuery(query.id);
@@ -170,33 +185,35 @@ export async function handleWhisperCallback(
   if (!whisper || whisper.expiresAt < Date.now()) {
     if (whisper) whispers.delete(whisperId);
     await bot.answerCallbackQuery(query.id, {
-      text: "⏱ Шёпот устарел и больше недоступен",
+      text: "⏱ Шёпот устарел и недоступен",
       show_alert: true,
     });
     return;
   }
 
+  // Wrong user trying to read
   if (user.id !== whisper.targetId) {
     await bot.answerCallbackQuery(query.id, {
-      text: "🔒 Это сообщение предназначено не тебе",
+      text: "🔒 Это сообщение не для тебя",
       show_alert: true,
     });
     return;
   }
 
-  // Reveal to target
+  // Correct user — reveal via popup
   await bot.answerCallbackQuery(query.id, {
     text: `🔇 ${whisper.senderName} шепчет:\n\n${whisper.text}`,
     show_alert: true,
   });
 
-  // Remove whisper after reading — single use
+  // Single-use: remove after reading
   whispers.delete(whisperId);
 
-  // Update button to show read status
+  // Update the group message to show "read" state
   if (query.message) {
     await bot.editMessageText(
-      `🔇 <b>${whisper.senderName}</b> прошептал что-то <b>${whisper.targetName}</b>\n<i>✅ Сообщение прочитано</i>`,
+      `🔇 <b>${whisper.senderName}</b> прошептал что-то <b>${whisper.targetName}</b>\n` +
+      `<i>✅ Прочитано ${user.username ? `@${user.username}` : user.first_name}</i>`,
       {
         chat_id: query.message.chat.id,
         message_id: query.message.message_id,
