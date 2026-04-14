@@ -44,6 +44,7 @@ import { startMonitor, getLastHealthReport } from "./monitor";
 import {
   shouldGroupReply, rateLimitAllowed, incrementRate,
   touchDirectConvo, clearDirectConvo, isDirectConvo, recordMsg,
+  markNewMember, recordBotActivity, recordChatActivity, getQuietChats,
 } from "./group_guard";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
@@ -672,6 +673,50 @@ async function sendScheduledMessages(): Promise<void> {
 }
 
 setInterval(() => { void sendScheduledMessages(); }, 30_000);
+
+// ─── Activity boost: Sam occasionally initiates in quiet chats ────────────────
+// Every 25 minutes, pick one quiet group chat and send a proactive message
+// to get the conversation going. Only fires if the chat had activity in the
+// last hour (so it's not dead) but Sam hasn't spoken for 30+ minutes.
+
+async function runActivityBoost(): Promise<void> {
+  try {
+    const allChats = await db.select({ chatId: botChatsTable.chatId, type: botChatsTable.type })
+      .from(botChatsTable).catch(() => []);
+    const groupChatIds = allChats
+      .filter(c => c.type === "group" || c.type === "supergroup")
+      .map(c => Number(c.chatId));
+    if (!groupChatIds.length) return;
+
+    const quietIds = getQuietChats(groupChatIds, 30 * 60 * 1000, 60 * 60 * 1000);
+    if (!quietIds.length) return;
+
+    // Pick one random quiet chat
+    const targetId = quietIds[Math.floor(Math.random() * quietIds.length)];
+    if (!targetId) return;
+
+    const resp = await withRetry(() => groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT_BASE },
+        { role: "user", content: `[Чат затих. Напиши короткое живое сообщение от себя — вопрос, наблюдение, интересная тема или просто что-то, что разожжёт разговор. Не объявляй что ты "поднимаешь активность". Пиши как обычный участник. Максимум 1-2 предложения.]` },
+      ],
+      max_tokens: 100,
+      temperature: 1.0,
+    }), { label: "activity boost" });
+
+    const boostMsg = resp.choices[0]?.message?.content?.trim();
+    if (boostMsg) {
+      await bot.sendMessage(targetId, boostMsg).catch(() => {});
+      recordBotActivity(targetId);
+      logger.info({ chatId: targetId }, "Activity boost sent");
+    }
+  } catch (err) {
+    logger.warn({ err }, "Activity boost failed (non-critical)");
+  }
+}
+
+setInterval(() => { void runActivityBoost(); }, 25 * 60 * 1000);
 
 // ─── Web search for factual queries ──────────────────────────────────────────
 
@@ -1326,15 +1371,33 @@ async function runAutoModeration(msg: TelegramBot.Message): Promise<boolean> {
       try {
         if (doAutoban) {
           await bot.banChatMember(chatId, aggressorId);
-          await bot.sendMessage(chatId, `⚠️ Конфликт выявлен — агрессор забанен автоматически.`);
         } else {
           await bot.restrictChatMember(chatId, aggressorId, {
             permissions: { can_send_messages: false },
             until_date: Math.floor(Date.now() / 1000) + 30 * 60,
           });
-          await bot.sendMessage(chatId, `⚠️ Замечена эскалация конфликта. Участник замучен на 30 минут.`);
         }
         chatMsgHistory.delete(chatId);
+        // Sam reacts to the conflict in character — no sterile system messages
+        try {
+          const conflictReply = await withRetry(() => groq.chat.completions.create({
+            model: "llama-3.3-70b-versatile",
+            messages: [
+              { role: "system", content: SYSTEM_PROMPT_BASE },
+              { role: "user", content: doAutoban
+                ? `[В чате разгорелся серьёзный конфликт. Агрессивного участника забанили. Напиши короткую реакцию от себя — спокойно, без лишних слов, как человек который устал от токсичности. Без восклицательных знаков, без официоза.]`
+                : `[В чате началась эскалация конфликта. Участника замутили на 30 минут. Напиши короткую реакцию — ты немного устал от этой атмосферы, предложи успокоиться. Живо, по-человечески, коротко.]`,
+              },
+            ],
+            max_tokens: 120,
+            temperature: 0.8,
+          }), { label: "conflict reply" });
+          const conflictText = conflictReply.choices[0]?.message?.content?.trim();
+          if (conflictText) {
+            await bot.sendMessage(chatId, conflictText).catch(() => {});
+            recordBotActivity(chatId);
+          }
+        } catch { /* non-critical */ }
         return true;
       } catch { /* Insufficient permissions */ }
       void minSent;
@@ -1895,13 +1958,18 @@ bot.on("new_chat_members", async (msg) => {
             ]],
           },
         }).catch(() => {});
+        recordBotActivity(chatId);
       }
     } catch (err) {
       logger.warn({ err }, "Welcome AI greeting failed");
-      // Fallback simple greeting
       const fallback = `${name}, привет) добро пожаловать в чат, освойся`;
       await bot.sendMessage(chatId, fallback).catch(() => {});
+      recordBotActivity(chatId);
     }
+
+    // Keep bot attentive to this new member for 10 minutes so Sam can
+    // help them integrate — replies to their messages get priority.
+    markNewMember(chatId, member.id);
   }
 });
 
@@ -2083,6 +2151,7 @@ bot.on("message", async (msg) => {
     // Always record message for conflict detection and dialogue tracking
     recordMsg(chatId, from.id);
     recordForConflict(chatId, from.id, text);
+    recordChatActivity(chatId);
 
     // Custom group commands (triggers set by admins) — always handled
     const handled = await handleGroupCommand(bot, msg, text).catch(() => false);
@@ -2091,8 +2160,8 @@ bot.on("message", async (msg) => {
     // Auto-moderation (flood, spam, conflict) — always runs, takes priority
     const blocked = await runAutoModeration(msg).catch(() => false);
     if (blocked) {
-      // If a user was in a direct convo, end it when they get blocked
-      clearDirectConvo(chatId);
+      // Clear direct convo for this specific user if they got blocked
+      clearDirectConvo(chatId, from.id);
       return;
     }
 
@@ -2101,20 +2170,34 @@ bot.on("message", async (msg) => {
 
     if (reason === "skip") return; // Stay silent
 
-    // Rate limit applies to questions but NOT to direct mentions / active convos
-    const freeOfRateLimit = reason === "direct_mention" || reason === "reply_to_bot" || reason === "direct_convo";
+    // These reasons are always exempt from rate limiting — direct conversation
+    const freeOfRateLimit =
+      reason === "direct_mention" ||
+      reason === "reply_to_bot" ||
+      reason === "direct_convo" ||
+      reason === "new_member" ||
+      reason === "request";
+
+    // Rate-limited reasons (questions) — check limit before responding
     if (!freeOfRateLimit && !rateLimitAllowed(chatId)) return;
 
     try {
       const reply = await chat(from.id, chatId, text);
       if (reply?.trim()) {
         await sendWithTyping(chatId, reply);
-        incrementRate(chatId);
-        // Mark as direct conversation so next messages from this user get priority
-        if (reason === "direct_mention" || reason === "reply_to_bot") {
+        recordBotActivity(chatId);
+
+        // Only non-exempt replies count toward the per-chat rate cap
+        if (!freeOfRateLimit) incrementRate(chatId);
+
+        // Mark/refresh direct convo so next messages from this user stay prioritised
+        if (
+          reason === "direct_mention" ||
+          reason === "reply_to_bot" ||
+          reason === "direct_convo" ||
+          reason === "request"
+        ) {
           touchDirectConvo(chatId, from.id);
-        } else if (reason === "direct_convo") {
-          touchDirectConvo(chatId, from.id); // refresh timeout
         }
       }
     } catch (err) {
