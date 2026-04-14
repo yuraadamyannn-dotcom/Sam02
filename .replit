@@ -29,8 +29,8 @@ outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "BOT_POLLING=true PORT=8081 pnpm --filter @workspace/api-server run dev"
-waitForPort = 8081
+args = "BOT_POLLING=true PORT=8082 pnpm --filter @workspace/api-server run dev"
+waitForPort = 8082
 
 [agent]
 stack = "PNPM_WORKSPACE"
