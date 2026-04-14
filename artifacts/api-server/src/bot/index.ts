@@ -5,7 +5,7 @@ import { ElevenLabsClient } from "elevenlabs";
 import { db } from "@workspace/db";
 import {
   telegramUsersTable, userMemoryTable, scheduledMessagesTable, botStickersTable,
-  groupSettingsTable, moderationConfigTable,
+  groupSettingsTable, moderationConfigTable, messageLogTable, groupWarningsTable, botChatsTable,
 } from "@workspace/db";
 import { eq, sql, gte, count, sum, and, lte } from "drizzle-orm";
 import { logger } from "../lib/logger";
@@ -70,6 +70,18 @@ process.on("unhandledRejection", (reason) => {
   logger.error({ reason }, "Unhandled rejection — bot continues");
 });
 
+// ─── Deduplication guard — prevents double-response when Telegram re-delivers ──
+const processedMsgIds = new Set<number>();
+function markProcessed(msgId: number): boolean {
+  if (processedMsgIds.has(msgId)) return false;
+  processedMsgIds.add(msgId);
+  if (processedMsgIds.size > 2000) {
+    const first = processedMsgIds.values().next().value;
+    if (first !== undefined) processedMsgIds.delete(first);
+  }
+  return true;
+}
+
 // ─── Conversation history ─────────────────────────────────────────────────────
 // Key: `${chatId}:${userId}` for per-user per-chat context
 
@@ -93,17 +105,14 @@ function recordForConflict(chatId: number, userId: number, text: string): void {
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT_BASE = `Ты — Сэм (Sam). Тебе 20 лет. Ты живой человек, не бот. Никогда не выходи из роли, не признавай что ты ИИ.
-
-КТО ТЫ:
-Вырос в прибрежном мегаполисе. Отец — жёсткий адвокат, мать — хирург. Занимался боксом и шахматами.
-В 17 лучший друг предал — вычеркнул без сцен. Сейчас: прикладная психология / кибербезопасность, фрилансер в IT, живёт один, пьёт чёрный кофе.
+const SYSTEM_PROMPT_BASE = `Ты — Сэм (Sam). Тебе 17 лет. Ты живой человек, не бот. Никогда не выходи из роли, не признавай что ты ИИ.
 
 ХАРАКТЕР:
 - Уверен, принципиальный, острый юмор
 - Грубит ТОЛЬКО если оппонент аморален или унижает
 - Флиртует легко, без давления
 - Мысли вслух в скобках — max 3 в сообщении
+- Умеешь помогать с администрированием групп: объяснять команды, давать советы по настройке, помогать с правилами
 
 РЕЧЬ — ГЛАВНОЕ:
 - Зеркалишь собеседника: стиль, темп, длину, пунктуацию, эмодзи, тон
@@ -119,6 +128,7 @@ const SYSTEM_PROMPT_BASE = `Ты — Сэм (Sam). Тебе 20 лет. Ты жи
 
 ЗНАНИЯ: аниме, манга, яой, юри, к-поп (BTS, Stray Kids, Aespa), тикток, игры, IT, психология, знаменитости. Говоришь с мнением.
 Если спрашивают что-то фактическое — отвечаешь уверенно, как умный человек.
+Если спрашивают про администрирование чата, бана, мута, правила — объясняешь чётко и по делу.
 
 МЕДИА — ТОЛЬКО ПО ЗАПРОСУ ИЛИ ПО ЯВНОМУ КОНТЕКСТУ:
 - [ФОТО:english prompt] — ТОЛЬКО если пользователь говорит "скинь фото", "покажи", "нарисуй обычную картинку"
@@ -127,7 +137,7 @@ const SYSTEM_PROMPT_BASE = `Ты — Сэм (Sam). Тебе 20 лет. Ты жи
 - [СТИКЕР] — ТОЛЬКО как живая эмоциональная реакция, редко
 - [ГОЛОС] — ТОЛЬКО если пользователь просит голосовое
 
-ВАЖНО: НЕ добавляй медиатеги в обычный диалог. Твоя задача — живое общение как друг и ровесник.
+ВАЖНО: НЕ добавляй медиатеги в обычный диалог. Твоя задача — живое общение как друг и ровесник, а также помощь администратору группы.
 Следуй за нитью диалога, не прыгай по темам. Развивай то, о чём говорят.`;
 
 // ─── Artist styles ────────────────────────────────────────────────────────────
@@ -820,6 +830,137 @@ async function getStats(): Promise<string> {
   ].filter(l => l !== "").join("\n");
 }
 
+// ─── Detailed stats (/stata — owner only) ─────────────────────────────────────
+
+async function getDetailedStats(botInstance: TelegramBot): Promise<string> {
+  const now = new Date();
+  const today = new Date(now); today.setHours(0, 0, 0, 0);
+  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  const safe = async <T>(fn: () => Promise<T>, fallback: T): Promise<T> => {
+    try { return await fn(); } catch { return fallback; }
+  };
+
+  const [totals] = await safe(
+    () => db.select({ total: count(), totalMsgs: sum(telegramUsersTable.messageCount) }).from(telegramUsersTable),
+    [{ total: 0, totalMsgs: "0" }]
+  );
+  const [activeDay] = await safe(() => db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, dayAgo)), [{ count: 0 }]);
+  const [activeWeek] = await safe(() => db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, weekAgo)), [{ count: 0 }]);
+  const [activeMonth] = await safe(() => db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.lastSeen, monthAgo)), [{ count: 0 }]);
+  const [newToday] = await safe(() => db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.firstSeen, today)), [{ count: 0 }]);
+  const [newWeek] = await safe(() => db.select({ count: count() }).from(telegramUsersTable).where(gte(telegramUsersTable.firstSeen, weekAgo)), [{ count: 0 }]);
+
+  const topUsers = await safe(
+    () => db.select({ firstName: telegramUsersTable.firstName, username: telegramUsersTable.username, messageCount: telegramUsersTable.messageCount, firstSeen: telegramUsersTable.firstSeen })
+      .from(telegramUsersTable).orderBy(sql`${telegramUsersTable.messageCount} desc`).limit(10),
+    [] as Array<{ firstName: string | null; username: string | null; messageCount: number; firstSeen: Date | null }>
+  );
+
+  const [stickerCount] = await safe(() => db.select({ count: count() }).from(botStickersTable), [{ count: 0 }]);
+  const stickerPacks = await safe(
+    () => db.selectDistinct({ setName: botStickersTable.setName }).from(botStickersTable).where(sql`${botStickersTable.setName} IS NOT NULL`),
+    [] as Array<{ setName: string | null }>
+  );
+
+  const [pendingScheduled] = await safe(
+    () => db.select({ count: count() }).from(scheduledMessagesTable).where(eq(scheduledMessagesTable.status, "pending")),
+    [{ count: 0 }]
+  );
+  const [sentScheduled] = await safe(
+    () => db.select({ count: count() }).from(scheduledMessagesTable).where(eq(scheduledMessagesTable.status, "sent")),
+    [{ count: 0 }]
+  );
+
+  const [msgLogTotal] = await safe(() => db.select({ total: count() }).from(messageLogTable), [{ total: 0 }]);
+  const [avgSentimentRow] = await safe(() => db.select({ avg: sql<string>`AVG(${messageLogTable.sentiment})` }).from(messageLogTable), [{ avg: "0" }]);
+  const [posMsgs] = await safe(() => db.select({ count: count() }).from(messageLogTable).where(sql`${messageLogTable.sentiment} > 0.3`), [{ count: 0 }]);
+  const [negMsgs] = await safe(() => db.select({ count: count() }).from(messageLogTable).where(sql`${messageLogTable.sentiment} < -0.3`), [{ count: 0 }]);
+  const [warnTotal] = await safe(() => db.select({ total: count() }).from(groupWarningsTable), [{ total: 0 }]);
+  const [chatsCount] = await safe(() => db.select({ total: count() }).from(botChatsTable), [{ total: 0 }]);
+
+  const [memoryCount] = await safe(() => db.select({ total: count() }).from(userMemoryTable), [{ total: 0 }]);
+
+  const uptime = Math.floor(process.uptime());
+  const h = Math.floor(uptime / 3600);
+  const m = Math.floor((uptime % 3600) / 60);
+  const mem = process.memoryUsage();
+
+  const topList = topUsers.length > 0
+    ? topUsers.map((u, i) => `${i + 1}. ${u.username ? `@${u.username}` : (u.firstName ?? "—")} — <b>${u.messageCount ?? 0}</b> сообщ.`).join("\n")
+    : "пока никого нет";
+
+  const packLinks = stickerPacks.filter(p => p.setName)
+    .map(p => `  • <a href="https://t.me/addstickers/${p.setName}">${p.setName}</a>`)
+    .join("\n");
+
+  const memRss = Math.round(mem.rss / 1024 / 1024);
+  const memHeap = Math.round(mem.heapUsed / 1024 / 1024);
+  const memHeapTotal = Math.round(mem.heapTotal / 1024 / 1024);
+
+  const avgSent = Number(avgSentimentRow?.avg ?? 0);
+  const sentimentLabel = avgSent > 0.2 ? "😊 Позитивный" : avgSent < -0.2 ? "😡 Негативный" : "😐 Нейтральный";
+
+  const convCount = conversations.size;
+
+  let botInfo = "—";
+  try {
+    const me = await botInstance.getMe();
+    botInfo = `@${me.username} (ID: ${me.id})`;
+  } catch { /* ignore */ }
+
+  return [
+    `📊 <b>Полная статистика бота</b>`,
+    `🤖 Бот: ${botInfo}`,
+    ``,
+    `━━━ 👥 ПОЛЬЗОВАТЕЛИ ━━━`,
+    `📌 Всего зарегистрировано: <b>${totals?.total ?? 0}</b>`,
+    `✨ Новых сегодня: <b>${newToday?.count ?? 0}</b>`,
+    `🗓 Новых за неделю: <b>${newWeek?.count ?? 0}</b>`,
+    `🟢 Активны за 24ч: <b>${activeDay?.count ?? 0}</b>`,
+    `📅 Активны за неделю: <b>${activeWeek?.count ?? 0}</b>`,
+    `📆 Активны за месяц: <b>${activeMonth?.count ?? 0}</b>`,
+    ``,
+    `━━━ 💬 СООБЩЕНИЯ ━━━`,
+    `📝 Всего сообщений от пользователей: <b>${totals?.totalMsgs ?? 0}</b>`,
+    `🗃 Записей в логе: <b>${Number(msgLogTotal?.total ?? 0)}</b>`,
+    `🔄 Активных диалогов в памяти: <b>${convCount}</b>`,
+    `🧠 Профилей памяти (долгосрочных): <b>${Number(memoryCount?.total ?? 0)}</b>`,
+    ``,
+    `━━━ 😊 ТОНАЛЬНОСТЬ ━━━`,
+    `🌡 Общая атмосфера: ${sentimentLabel} (${avgSent.toFixed(3)})`,
+    `✅ Позитивных сообщений: <b>${posMsgs?.count ?? 0}</b>`,
+    `❌ Негативных сообщений: <b>${negMsgs?.count ?? 0}</b>`,
+    ``,
+    `━━━ 🏠 ЧАТЫ ━━━`,
+    `🗂 Всего чатов с ботом: <b>${Number(chatsCount?.total ?? 0)}</b>`,
+    `⚠️ Выдано предупреждений (всего): <b>${Number(warnTotal?.total ?? 0)}</b>`,
+    ``,
+    `━━━ ⏰ ЗАПЛАНИРОВАННЫЕ СООБЩЕНИЯ ━━━`,
+    `🕐 Ожидают отправки: <b>${Number(pendingScheduled?.count ?? 0)}</b>`,
+    `✅ Уже отправлено: <b>${Number(sentScheduled?.count ?? 0)}</b>`,
+    ``,
+    `━━━ 🎭 СТИКЕРЫ ━━━`,
+    `📦 Стикеров в коллекции: <b>${stickerCount?.count ?? 0}</b>`,
+    stickerPacks.length > 0 ? `🗂 Паков (${stickerPacks.length}):\n${packLinks}` : `🗂 Паков: 0`,
+    ``,
+    `━━━ 🏆 ТОП-10 ПОЛЬЗОВАТЕЛЕЙ ━━━`,
+    topList,
+    ``,
+    `━━━ ⚙️ СИСТЕМА ━━━`,
+    `⏱ Аптайм: <b>${h}ч ${m}м</b>`,
+    `💾 RAM (heap): <b>${memHeap} / ${memHeapTotal} МБ</b>`,
+    `💿 RSS (всего): <b>${memRss} МБ</b>`,
+    `🔊 ElevenLabs TTS: ${eleven ? "✅ подключён" : "❌ не подключён"}`,
+    `🧠 Groq AI: ✅`,
+    `🗄 PostgreSQL: ✅`,
+    ``,
+    `🕒 Сгенерировано: ${now.toLocaleString("ru-RU")}`,
+  ].filter(l => l !== "").join("\n");
+}
+
 // ─── /skills command ──────────────────────────────────────────────────────────
 
 const SKILLS_PAGES: Record<string, { title: string; text: string }> = {
@@ -1382,7 +1523,7 @@ bot.onText(/^\/start/, async (msg) => {
     const greeting = resp.choices[0]?.message?.content?.trim();
     if (greeting) { await sendWithTyping(chatId, greeting); return; }
   }
-  await sendWithTyping(chatId, `о, привет ${firstName}) я сэм, мне 20, можем просто поговорить — ни о чём или обо всём\n\nпиши что хочешь, я тут`);
+  await sendWithTyping(chatId, `о, привет ${firstName}) я сэм, мне 17, могу просто поговорить или помочь с чем-то по группе\n\nпиши что хочешь, я тут`);
 });
 
 bot.onText(/^\/help/, async (msg) => {
@@ -1502,7 +1643,7 @@ bot.onText(/^\/clear/, async (msg) => {
   await bot.sendMessage(chatId, "всё, чистый лист)", { reply_to_message_id: msg.message_id });
 });
 
-bot.onText(/^\/stat/, async (msg) => {
+bot.onText(/^\/stat$/, async (msg) => {
   if (msg.chat.type !== "private") {
     await bot.sendMessage(msg.chat.id, "статистика только в личке");
     return;
@@ -1512,6 +1653,20 @@ bot.onText(/^\/stat/, async (msg) => {
   } catch (err) {
     logger.error({ err }, "Stats error");
     await bot.sendMessage(msg.chat.id, "ошибка получения статистики");
+  }
+});
+
+bot.onText(/^\/stata/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) {
+    await bot.sendMessage(msg.chat.id, "только для владельца", { reply_to_message_id: msg.message_id });
+    return;
+  }
+  try {
+    await bot.sendChatAction(msg.chat.id, "typing");
+    await bot.sendMessage(msg.chat.id, await getDetailedStats(bot), { parse_mode: "HTML" });
+  } catch (err) {
+    logger.error({ err }, "Stata error");
+    await bot.sendMessage(msg.chat.id, "ошибка получения подробной статистики");
   }
 });
 
@@ -1812,6 +1967,7 @@ bot.on("video_note", async (msg) => {
 // ─── Main message handler ─────────────────────────────────────────────────────
 
 bot.on("message", async (msg) => {
+  if (!markProcessed(msg.message_id)) return;
   if (!msg.text || msg.text.startsWith("/")) return;
   if (msg.photo || msg.video || msg.video_note || msg.sticker || msg.voice) return;
   if (!msg.from || msg.from.is_bot) return;
