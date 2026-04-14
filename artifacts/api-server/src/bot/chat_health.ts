@@ -106,7 +106,7 @@ export async function getChatHealthReport(
 ): Promise<string> {
   try {
     const [memberCount, admins] = await Promise.all([
-      bot.getChatMembersCount(chatId).catch(() => 0),
+      bot.getChatMemberCount(chatId).catch(() => 0),
       bot.getChatAdministrators(chatId).catch(() => [] as TelegramBot.ChatMember[]),
     ]);
 

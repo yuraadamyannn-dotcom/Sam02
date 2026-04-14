@@ -51,6 +51,12 @@ import {
   recordSentimentForHealth, getRecentSentiments,
 } from "./chat_health";
 import { startRandomInteractive } from "./interactives";
+import {
+  handleInvite, recordReferral, handleReferrals,
+  handleBroadcastMention, handleAddUser,
+  startCaptcha, handleCaptchaCallback,
+  handleDmLink, handleInviteStats,
+} from "./referral";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
@@ -1661,12 +1667,25 @@ bot.on("callback_query", async (query) => {
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
-bot.onText(/^\/start/, async (msg) => {
+bot.onText(/^\/start(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const from = msg.from;
   conversations.delete(convKey(chatId, from?.id ?? chatId));
   if (from) await trackUser(from);
   await trackBotChat(bot, msg);
+
+  // Handle referral deep link: /start ref_{chatId}_{referrerId}
+  const startParam = match?.[1]?.trim() ?? "";
+  if (startParam.startsWith("ref_") && from) {
+    const parts = startParam.split("_");
+    const refChatId = Number(parts[1]);
+    const referrerId = Number(parts[2]);
+    if (refChatId && referrerId && !isNaN(refChatId) && !isNaN(referrerId)) {
+      await recordReferral(bot, from.id, referrerId, refChatId);
+      await sendWithTyping(chatId, `привет! ты пришёл по реферальной ссылке от другого участника 👋\n\nя сэм, мне 17. пиши если нужна помощь или просто хочешь поговорить`);
+      return;
+    }
+  }
 
   const firstName = from?.first_name ?? "дружище";
   const memory = await loadMemory(from?.id ?? chatId);
@@ -1900,7 +1919,7 @@ bot.onText(/^\/members/, async (msg) => {
   }
   try {
     const [count, admins] = await Promise.all([
-      bot.getChatMembersCount(chatId).catch(() => 0),
+      bot.getChatMemberCount(chatId).catch(() => 0),
       bot.getChatAdministrators(chatId).catch(() => [] as TelegramBot.ChatMember[]),
     ]);
     const humanAdmins = (admins as TelegramBot.ChatMember[]).filter(a => !a.user.is_bot);
