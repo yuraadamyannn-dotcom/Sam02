@@ -34,7 +34,33 @@ const duelChallenges = new Map<string, DuelChallenge>();
 const marriageProposals = new Map<string, MarriageProposal>();
 const mafiaGames = new Map<number, MafiaGame>();
 
-const MAFIA_ROLES = ["Мафия", "Мафия", "Шериф", "Доктор", "Мирный", "Мирный", "Мирный", "Мирный"];
+// Role priority order: special roles added as player count grows
+// 4p: Мафия, Шериф, Мирный×2
+// 5p: +Мафия
+// 6p: +Доктор
+// 7p: +Любовница
+// 8p: +Комиссар
+// 9p: +Маньяк
+// 10p: +Церковник
+// 11p: +Депутат
+// 12p+: extra Мафия, rest Мирный
+
+function buildRoles(count: number): string[] {
+  const roles: string[] = [];
+  const mafiaCount = count <= 6 ? 2 : count <= 9 ? 2 : 3;
+
+  for (let i = 0; i < mafiaCount; i++) roles.push("Мафия");
+  roles.push("Шериф");
+  if (count >= 6) roles.push("Доктор");
+  if (count >= 7) roles.push("Любовница");
+  if (count >= 8) roles.push("Комиссар");
+  if (count >= 9) roles.push("Маньяк");
+  if (count >= 10) roles.push("Церковник");
+  if (count >= 11) roles.push("Депутат");
+
+  while (roles.length < count) roles.push("Мирный");
+  return roles.sort(() => Math.random() - 0.5);
+}
 
 function duelKey(chatId: number, targetId: number) { return `${chatId}:${targetId}`; }
 function proposalKey(chatId: number, targetId: number) { return `${chatId}:${targetId}`; }
@@ -349,11 +375,7 @@ export async function handleMafiaCallback(bot: TelegramBot, query: TelegramBot.C
 
     // Assign roles
     const playerIds = Array.from(game.players.keys());
-    const shuffledRoles = [...MAFIA_ROLES].sort(() => Math.random() - 0.5);
-    const rolesNeeded = playerIds.length;
-    const extraCivilians = Math.max(0, rolesNeeded - MAFIA_ROLES.length);
-    const roles = shuffledRoles.slice(0, rolesNeeded).concat(Array(extraCivilians).fill("Мирный"));
-    roles.sort(() => Math.random() - 0.5);
+    const roles = buildRoles(playerIds.length);
 
     const mafiaPlayers: string[] = [];
     for (let i = 0; i < playerIds.length; i++) {
@@ -378,12 +400,42 @@ export async function handleMafiaCallback(bot: TelegramBot, query: TelegramBot.C
   }
 }
 
+const ROLE_EMOJIS: Record<string, string> = {
+  "Мафия": "🔫",
+  "Шериф": "🔍",
+  "Доктор": "💊",
+  "Любовница": "💋",
+  "Комиссар": "👮",
+  "Маньяк": "🔪",
+  "Церковник": "⛪",
+  "Депутат": "🏛",
+  "Мирный": "👥",
+};
+
+export function getRoleEmoji(role: string): string {
+  return ROLE_EMOJIS[role] ?? "👤";
+}
+
 function getRoleDescription(role: string): string {
   switch (role) {
-    case "Мафия": return "Ты мафиози. Ночью договаривайся с командой и убивайте мирных. Днём — притворяйся своим.";
-    case "Шериф": return "Ты шериф. Ночью можешь проверить одного игрока — мафия ты или нет.";
-    case "Доктор": return "Ты доктор. Каждую ночь можешь спасти одного игрока от смерти.";
-    default: return "Ты мирный житель. Найди мафию и вычисли их с командой на голосовании.";
+    case "Мафия":
+      return `🔫 <b>Мафия</b>\n\nТы мафиози. Ночью в личке договаривайся с командой — выберите жертву и напишите ведущему. Днём притворяйся мирным, отводи подозрения от своих. 3 убийства подряд — и мафия побеждает.`;
+    case "Шериф":
+      return `🔍 <b>Шериф</b>\n\nТы страж порядка. Каждую ночь напиши ведущему имя одного игрока для проверки — он скажет: мафия или нет. Используй информацию, чтобы направить голосование. Не раскрывайся слишком рано!`;
+    case "Доктор":
+      return `💊 <b>Доктор</b>\n\nТы хирург. Каждую ночь напиши ведущему имя игрока для защиты — этой ночью мафия не убьёт его. Себя можно защитить, но только один раз за игру. Угадай кого атакуют — и спаси жизнь.`;
+    case "Любовница":
+      return `💋 <b>Любовница</b>\n\nТы соблазнительница. Каждую ночь выбираешь одного игрока и "проводишь с ним ночь" — он теряет ночное действие. Если посетишь мафиози — узнаешь что он из мафии, но он тоже узнает о тебе. Играй осторожно.`;
+    case "Комиссар":
+      return `👮 <b>Комиссар</b>\n\nТы следователь. Раз за ночь можешь "задержать" одного игрока — он лишается ночного действия и не может быть убит этой ночью (но и ты теряешь свою). Помогай горожанам, блокируй ключевых персонажей.`;
+    case "Маньяк":
+      return `🔪 <b>Маньяк</b>\n\nТы одиночка. Каждую ночь убиваешь одного игрока — независимо от мафии. Твоя цель: остаться последним живым. Ты проигрываешь и мафии, и горожанам — выигрываешь только если все остальные мертвы. Никому не доверяй.`;
+    case "Церковник":
+      return `⛪ <b>Церковник</b>\n\nТы духовный защитник. Раз в ночь можешь "благословить" одного игрока — если мафия атакует его этой ночью, атака провалится. Благословение одноразовое на каждого. Найди союзников и защити их от тьмы.`;
+    case "Депутат":
+      return `🏛 <b>Депутат</b>\n\nТы влиятельный политик. У тебя есть депутатская неприкосновенность — одну ночь мафия не может тебя убить (используется автоматически в первую атаку). Также раз за игру можешь потребовать экстренное голосование вне очереди.`;
+    default:
+      return `👥 <b>Мирный житель</b>\n\nТы обычный горожанин. Твоё оружие — наблюдательность и логика. Следи за поведением игроков днём, ищи подозрительных и голосуй на казнь. Горожане побеждают, если вычислят всю мафию.`;
   }
 }
 

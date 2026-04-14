@@ -63,6 +63,7 @@ import {
   isEngagementCallback, handleEngagementCallback,
   isWhitelisted, detectMassModAction, executeMassModAction,
 } from "./engagement";
+import { detectWhisper, handleWhisper, handleWhisperCallback } from "./whisper";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
@@ -785,21 +786,29 @@ async function webSearch(query: string): Promise<string> {
 // ─── Music detection ──────────────────────────────────────────────────────────
 
 function isMusicRequest(text: string): string | null {
+  const MUSIC_WORDS = /трек|песню|музыку|song|track|плейлист|playlist/i;
   const patterns = [
-    // "найди трек X", "найди песню X", "дай трек X", "дай песню X"
-    /(?:найди|поищи|скинь|включи|хочу послушать|поставь|дай|давай|кинь)\s+(?:мне\s+)?(?:трек|песню|музыку|song|track)?\s*[«""]?(.+?)[»""]?$/i,
-    // "найди трек" / "найди песню" без слова song/трек
-    /^(?:найди|поищи|скинь|дай)\s+[«""]?(.+?)[»""]?$/i,
-    // "трек X" / "песня X"
+    // Requires explicit music word: "найди трек X", "скинь песню X", "дай музыку X"
+    /(?:найди|поищи|скинь|включи|хочу послушать|поставь|дай|давай|кинь)\s+(?:мне\s+)?(?:трек|песню|музыку|song|track)\s+[«""]?(.+?)[»""]?$/i,
+    // Verb + music-word + artist/title inline: "найди «трек» X" with music word already matched above
+    // "трек X" / "песня X" at start — must begin with music word
     /^(?:песня|трек|song|track)\s+[«""]?(.+?)[»""]?$/i,
-    // "это песня X" / "ищу трек X"
+    // "ищу трек X" / "это трек X"
     /(?:это|ищу)\s+(?:песня|трек|song|track)\s+[«""]?(.+?)[»""]?/i,
-    // "поставь X" / "включи X"
+    // "поставь X" / "включи X" / "врубай X" — playback verbs strongly imply music
     /^(?:поставь|включи|врубай|врубить)\s+[«""]?(.+?)[»""]?$/i,
+    // Explicit request WITH music word somewhere in message
+    /(?:найди|поищи|скинь|кинь|дай)\s+(?:мне\s+)?[«""]?(.+?)[»""]?$/i,
   ];
-  for (const p of patterns) {
+
+  for (let i = 0; i < patterns.length; i++) {
+    const p = patterns[i]!;
     const m = text.match(p);
-    if (m?.[1] && m[1].trim().length > 2) return m[1].trim();
+    if (m?.[1] && m[1].trim().length > 2) {
+      // Last broad pattern — only allow if message explicitly contains a music word
+      if (i === patterns.length - 1 && !MUSIC_WORDS.test(text)) continue;
+      return m[1].trim();
+    }
   }
   return null;
 }
@@ -1167,6 +1176,14 @@ const SKILLS_PAGES: Record<string, { title: string; text: string }> = {
 <code>/mute [@user/reply] [минуты]</code> — замутить (по умолчанию 10 мин)
 <code>/unmute [@user/reply]</code> — снять мут
 
+🔇 <b>Шёпот — личное сообщение в группе</b>
+Отправь секретное сообщение прямо в чате — прочитать сможет только адресат:
+<code>шёпот @username текст</code> — шёпот конкретному пользователю
+Или выдели (reply) чьё-то сообщение и напиши: <code>шёпот текст</code>
+• Кнопка «Прочитать шёпот» видна всем, но текст — только адресату
+• Одноразовое: после прочтения исчезает
+• Твоё сообщение с командой автоматически удаляется
+
 🗣 <b>Модерация голосом (только для админов)</b>
 Напиши в чат — Сэм выполнит:
 <code>Сэм забань @user1 @user2</code> — забанить одного или нескольких
@@ -1196,26 +1213,43 @@ const SKILLS_PAGES: Record<string, { title: string; text: string }> = {
 
 ⚔️ <b>Дуэль</b>
 <code>/duel @username</code> — вызвать на дуэль
-Принять или отказать кнопками в течение 60 секунд
+Принять или отказать кнопками в течение 2 минут
 Механика: бросок кубика, победитель определяется по очкам
-Результат сообщается всему чату
 
 💍 <b>Система брака</b>
 <code>/marry @username</code> — сделать предложение
 Партнёр принимает или отклоняет кнопками
-<code>/divorce</code> — развестись с партнёром
-<code>/marriage</code> или <code>/marriagestatus</code> — проверить статус
-Брак хранится в базе данных, привязан к чату
+<code>/divorce</code> — развестись
+<code>/marriage</code> — проверить статус брака
 
-🎭 <b>Мафия</b>
-<code>/mafia</code> — создать лобби (нужно мин. 4 игрока)
-Вступить кнопкой "Вступить в игру" в течение 60 секунд
-Роли раздаются случайно в личку каждому:
-• 🔫 Мафия — убивает мирных ночью
-• 🔍 Шериф — проверяет игроков ночью
-• 💊 Доктор — лечит одного игрока ночью
-• 👥 Мирный — голосует и выявляет мафию днём
-<code>/mafiaend</code> — принудительно завершить игру (только создатель/админ)`,
+🎭 <b>Мафия — расширенная версия</b>
+<code>/mafia</code> — создать лобби (мин. 4 игрока)
+<code>/mafiaend</code> — завершить игру (только организатор/админ)
+
+Роли раздаются в личку — состав зависит от числа игроков:
+
+<b>Всегда в игре:</b>
+🔫 <b>Мафия</b> — убивает мирных ночью, притворяется своим днём
+🔍 <b>Шериф</b> — проверяет игроков ночью (мафия / не мафия)
+👥 <b>Мирный</b> — выявляет мафию голосованием
+
+<b>6+ игроков:</b>
+💊 <b>Доктор</b> — защищает одного игрока от убийства каждую ночь
+
+<b>7+ игроков:</b>
+💋 <b>Любовница</b> — "навещает" игрока: блокирует его ночное действие
+
+<b>8+ игроков:</b>
+👮 <b>Комиссар</b> — "задерживает" игрока, лишая его ночного действия
+
+<b>9+ игроков:</b>
+🔪 <b>Маньяк</b> — одиночка, убивает самостоятельно, выигрывает в одиночку
+
+<b>10+ игроков:</b>
+⛪ <b>Церковник</b> — благословляет игрока, защищая от одного убийства
+
+<b>11+ игроков:</b>
+🏛 <b>Депутат</b> — депутатская неприкосновенность (первая атака блокируется)`,
   },
   psychology: {
     title: "🧠 Психология",
@@ -1545,6 +1579,17 @@ bot.on("callback_query", async (query) => {
   const chatId = query.message?.chat.id;
   const msgId = query.message?.message_id;
   const userId = query.from.id;
+
+  // ── Whisper: must intercept BEFORE the generic answerCallbackQuery so we
+  //    can use show_alert to display the secret message in a popup ──────────
+  if (data.startsWith("whisper:")) {
+    await handleWhisperCallback(bot, query).catch(() => {});
+    return;
+  }
+  if (data === "whisper_read") {
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    return;
+  }
 
   // ── 1. НЕМЕДЛЕННО убираем "часики" — первый вызов всегда ──────────────────
   await bot.answerCallbackQuery(query.id).catch(() => {});
@@ -2514,6 +2559,15 @@ bot.on("message", async (msg) => {
     recordMsg(chatId, from.id);
     recordForConflict(chatId, from.id, text);
     recordChatActivity(chatId);
+
+    // ── Whisper command: "шёпот @user текст" or reply+шёпот ────────────────────
+    const whisperIntent = detectWhisper(msg);
+    if (whisperIntent) {
+      await handleWhisper(bot, msg, whisperIntent).catch(e =>
+        logger.error({ e }, "handleWhisper error")
+      );
+      return;
+    }
 
     // Custom group commands (triggers set by admins) — always handled
     const handled = await handleGroupCommand(bot, msg, text).catch(() => false);
