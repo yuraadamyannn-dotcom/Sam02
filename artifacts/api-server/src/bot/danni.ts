@@ -8,8 +8,9 @@ import { eq, and, count, avg, desc, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { analyzeSentiment } from "./utils/sentiment";
 
-// Owner ID — only this user can access /danni
-export const BOT_OWNER_ID = 8188102679;
+// Owner ID — read from ADMIN_TELEGRAM_ID env secret, fallback to hardcoded
+const _envOwnerId = process.env["ADMIN_TELEGRAM_ID"];
+export const BOT_OWNER_ID: number = _envOwnerId ? parseInt(_envOwnerId, 10) : 8188102679;
 export const BOT_OWNER_USERNAME = "Wuixoll";
 
 export function isOwner(userId: number): boolean {

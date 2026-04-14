@@ -31,8 +31,10 @@ pnpm workspace monorepo using TypeScript. Telegram AI bot "Сэм (Sam)" — a 2
 - `bot/chat_health.ts` — sentiment tracking, DM offended users, DM admins on conflict, `/chathealth` report
 - `bot/interactives.ts` — random polls, would-you-rather, word games, AI trivia for activity boost
 - `bot/admin.ts` — Group admin: ban/mute/warn/rules/welcome/custom commands
-- `bot/danni.ts` — Analytics: /danni, /danni_chat, /export_data (owner-only)
-- `bot/broadcast.ts` — Broadcast system (owner-only)
+- `bot/danni.ts` — Analytics: /danni, /danni_chat, /export_data (owner-only). Owner ID from `ADMIN_TELEGRAM_ID` env var.
+- `bot/broadcast.ts` — Broadcast system (owner-only global, or group mention in groups)
+- `bot/referral.ts` — /invite, /referrals leaderboard, /adduser, /dmlink, /invitestats, captcha for newcomers
+- `bot/engagement.ts` — Advanced engagement: rate-limited mass invites, whitelist system, /spam_check, /stats panel, /mention
 - `bot/utils/backoff.ts` — Exponential backoff with jitter, timeout wrapper
 - `bot/utils/sentiment.ts` — Russian sentiment analysis, conflict detection
 - `bot/utils/spam.ts` — Flood detection, spam filter
@@ -59,8 +61,10 @@ pnpm workspace monorepo using TypeScript. Telegram AI bot "Сэм (Sam)" — a 2
 - `moderation_config` — per-group moderation settings
 
 ### Owner
-- Username: @Wuixoll, ID: 8188102679
-- Access: /danni, /status, /broadcast
+- Username: @Wuixoll
+- ID read from `ADMIN_TELEGRAM_ID` env secret (fallback: 8188102679)
+- Access: /danni, /status, /broadcast, /stata, /stats, /spam_check, /whitelist, /add_users
+- Bot greets owner as "создатель/владелец" with a special dashboard keyboard on /start
 
 ## Python Failover Bot (`bot/`)
 
@@ -99,7 +103,7 @@ python-telegram-bot==21.10, google-generativeai==0.8.5, openai==1.82.0, groq==0.
 - `GROQ_API_KEY` — required (TS bot + Python STT fallback)
 - `GEMINI_API_KEY` — required for Python bot (primary AI)
 - `GROK_API_KEY` — required for Python bot (fallback AI)
-- `ADMIN_TELEGRAM_ID` — optional (Python bot: downtime alerts)
+- `ADMIN_TELEGRAM_ID` — owner Telegram user ID (used by both TS and Python bots for owner recognition, alerts, admin access)
 - `ELEVENLABS_API_KEY` — optional (TS TTS; falls back to no voice if missing)
 - `SESSION_SECRET` — Express session
 - `DATABASE_URL` — PostgreSQL connection

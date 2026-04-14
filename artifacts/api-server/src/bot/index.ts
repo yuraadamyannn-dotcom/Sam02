@@ -57,6 +57,12 @@ import {
   startCaptcha, handleCaptchaCallback,
   handleDmLink, handleInviteStats,
 } from "./referral";
+import {
+  handleWhitelist, handleSpamCheck, handleEngagementStats,
+  handleMassAddUsers, handleMention,
+  isEngagementCallback, handleEngagementCallback,
+  isWhitelisted,
+} from "./engagement";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
@@ -1649,6 +1655,71 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
+    // ── Owner dashboard callbacks ──────────────────────────────────────────────
+    if (data === "owner_stats") {
+      if (!isOwner(userId)) return;
+      await bot.answerCallbackQuery(query.id, { text: "📊 Загружаю..." });
+      if (chatId) {
+        await bot.sendChatAction(chatId, "typing");
+        await bot.sendMessage(chatId, await getDetailedStats(bot), { parse_mode: "HTML" });
+      }
+      return;
+    }
+    if (data === "owner_stata") {
+      if (!isOwner(userId)) return;
+      await bot.answerCallbackQuery(query.id, { text: "📊 Загружаю подробную статистику..." });
+      if (chatId) {
+        await bot.sendChatAction(chatId, "typing");
+        await bot.sendMessage(chatId, await getDetailedStats(bot), { parse_mode: "HTML" });
+      }
+      return;
+    }
+    if (data === "owner_status") {
+      if (!isOwner(userId)) return;
+      await bot.answerCallbackQuery(query.id);
+      const mem = process.memoryUsage();
+      const uptime = Math.floor(process.uptime());
+      const h = Math.floor(uptime / 3600);
+      const m2 = Math.floor((uptime % 3600) / 60);
+      if (chatId) {
+        await bot.sendMessage(chatId, [
+          `🤖 <b>Статус бота</b>`,
+          `⏱ Аптайм: ${h}ч ${m2}м`,
+          `💾 RAM: ${Math.round(mem.heapUsed/1024/1024)}МБ / ${Math.round(mem.heapTotal/1024/1024)}МБ`,
+          `🔊 ElevenLabs: ${eleven ? "✅" : "❌"}`,
+          `🧠 Groq: ✅`,
+          `🗃 DB: ✅`,
+        ].join("\n"), { parse_mode: "HTML" });
+      }
+      return;
+    }
+
+    // ── Engagement callbacks ───────────────────────────────────────────────────
+    if (isEngagementCallback(data)) {
+      await handleEngagementCallback(bot, query);
+      return;
+    }
+
+    // ── Captcha callback ───────────────────────────────────────────────────────
+    if (data.startsWith("captcha:")) {
+      const parts = data.split(":");
+      const capChatId = parseInt(parts[1] ?? "0");
+      const capUserId = parseInt(parts[2] ?? "0");
+      if (capChatId && capUserId) {
+        await handleCaptchaCallback(bot, query, capChatId, capUserId);
+      }
+      return;
+    }
+
+    // Welcome PM button — send a deep link to start DM with bot
+    if (data === "welcome_pm") {
+      await bot.answerCallbackQuery(query.id, {
+        url: `https://t.me/${BOT_USERNAME}?start=hello`,
+        text: "Открываю личку с ботом!",
+      }).catch(() => {});
+      return;
+    }
+
     // Moderation / fallback
     if (data.startsWith("mod_")) return;
 
@@ -1685,6 +1756,32 @@ bot.onText(/^\/start(?:\s+(.+))?/, async (msg, match) => {
       await sendWithTyping(chatId, `привет! ты пришёл по реферальной ссылке от другого участника 👋\n\nя сэм, мне 17. пиши если нужна помощь или просто хочешь поговорить`);
       return;
     }
+  }
+
+  // ── Owner/creator special greeting ──
+  if (from && isOwner(from.id)) {
+    const ownerGreetings = [
+      `о, создатель, привет) давно тебя не видел`,
+      `создатель вернулся. всё под контролем, всё работает`,
+      `привет, владелец. чем займёмся?`,
+      `хей, создатель. рад что ты тут`,
+    ];
+    const pick = ownerGreetings[Math.floor(Math.random() * ownerGreetings.length)];
+    await sendWithTyping(chatId, pick, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "📊 Статистика", callback_data: "owner_stats" },
+            { text: "📢 Рассылка", callback_data: "broadcast_mode:all" },
+          ],
+          [
+            { text: "🔧 /stata", callback_data: "owner_stata" },
+            { text: "🛡 Статус", callback_data: "owner_status" },
+          ],
+        ],
+      },
+    });
+    return;
   }
 
   const firstName = from?.first_name ?? "дружище";
@@ -1885,9 +1982,18 @@ bot.onText(/^\/export_data/, async (msg) => {
   await handleExportData(bot, msg);
 });
 
-// /broadcast
-bot.onText(/^\/broadcast/, async (msg) => {
-  await handleBroadcastCommand(bot, msg);
+// /broadcast — two modes:
+//   In group: /broadcast @username message  → mention user with text
+//   In DM (owner): /broadcast               → global broadcast to all chats
+bot.onText(/^\/broadcast(?:\s+(@\S+)\s+(.+))?/, async (msg, m) => {
+  const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+  if (isGroup && m?.[1] && m?.[2]) {
+    // Group mention mode
+    await handleBroadcastMention(bot, msg, m[1], m[2]);
+  } else {
+    // Owner global broadcast
+    await handleBroadcastCommand(bot, msg);
+  }
 });
 
 // Group admin commands
@@ -2030,6 +2136,58 @@ bot.onText(/^\/setrule\s+(.+)/, async (msg, m) => {
 
 bot.onText(/^\/ruleslist/, async (msg) => { await handleRules(bot, msg); });
 
+// ─── Referral & engagement commands ──────────────────────────────────────────
+
+bot.onText(/^\/invite/, async (msg) => {
+  await handleInvite(bot, msg, BOT_USERNAME);
+});
+
+bot.onText(/^\/referrals/, async (msg) => {
+  await handleReferrals(bot, msg);
+});
+
+bot.onText(/^\/invitestats/, async (msg) => {
+  await handleInviteStats(bot, msg);
+});
+
+bot.onText(/^\/dmlink/, async (msg) => {
+  await handleDmLink(bot, msg, BOT_USERNAME);
+});
+
+// /adduser @u1 @u2 — generate one-use invite links (original referral version)
+bot.onText(/^\/adduser(.*)/, async (msg, m) => {
+  const raw = m?.[1]?.trim() ?? "";
+  const usernames = raw.match(/@\w+/g) ?? [];
+  await handleAddUser(bot, msg, usernames);
+});
+
+// /add_users @u1 @u2 — rate-limited mass invite (engagement version)
+bot.onText(/^\/add_users(.*)/, async (msg, m) => {
+  const raw = m?.[1]?.trim() ?? "";
+  const usernames = raw.match(/@\w+/g) ?? [];
+  await handleMassAddUsers(bot, msg, usernames);
+});
+
+// /mention @username message — @mention a user in group (for admins)
+bot.onText(/^\/mention\s+(@\S+)(?:\s+(.+))?/, async (msg, m) => {
+  await handleMention(bot, msg, m?.[1] ?? "", m?.[2] ?? "", BOT_USERNAME);
+});
+
+// /stats — engagement stats panel for admins
+bot.onText(/^\/stats/, async (msg) => {
+  await handleEngagementStats(bot, msg);
+});
+
+// /spam_check — audit newly joined users
+bot.onText(/^\/spam_check/, async (msg) => {
+  await handleSpamCheck(bot, msg);
+});
+
+// /whitelist — manage trusted users
+bot.onText(/^\/whitelist(?:\s+(.+))?/, async (msg, m) => {
+  await handleWhitelist(bot, msg, m?.[1] ?? "");
+});
+
 // Game commands
 bot.onText(/^\/duel/, async (msg) => {
   const target = extractUserFromText(msg.text ?? "", msg);
@@ -2103,6 +2261,13 @@ bot.on("new_chat_members", async (msg) => {
       const fallback = `${name}, привет) добро пожаловать в чат, освойся`;
       await bot.sendMessage(chatId, fallback).catch(() => {});
       recordBotActivity(chatId);
+    }
+
+    // 3. Captcha — skip for whitelisted users
+    if (!isWhitelisted(chatId, member.id)) {
+      await startCaptcha(bot, chatId, member).catch(() => {});
+    } else {
+      logger.info({ chatId, userId: member.id }, "Whitelisted user — captcha skipped");
     }
 
     // Keep bot attentive to this new member for 10 minutes so Sam can
