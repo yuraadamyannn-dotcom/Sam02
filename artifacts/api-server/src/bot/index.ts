@@ -820,15 +820,13 @@ async function sendScheduledMessages(): Promise<void> {
       try {
         await db.update(scheduledMessagesTable).set({ status: "sent" }).where(eq(scheduledMessagesTable.id, msg.id));
         const memory = await loadMemory(msg.userId);
-        const resp = await withRetry(() => groq.chat.completions.create({
-          model: "llama-3.3-70b-versatile",
-          messages: [
+        const text = await getAIResponse(
+          [
             { role: "system", content: systemPromptFor(msg.userId, memory) },
             { role: "user", content: `[Ты пишешь первым. Повод: ${msg.prompt}. Короткое живое сообщение как друг. Без "!"]` },
           ],
-          max_tokens: 150,
-        }), { label: "scheduled msg" });
-        const text = resp.choices[0]?.message?.content?.trim();
+          { maxTokens: 150, label: "scheduled msg" },
+        );
         if (text) await sendWithTyping(msg.userId, text);
       } catch (err) {
         logger.error({ err, msgId: msg.id }, "Scheduled message failed");
@@ -869,17 +867,13 @@ async function runActivityBoost(): Promise<void> {
       const sent = await startRandomInteractive(bot, groq, SYSTEM_PROMPT_BASE, targetId);
       if (sent) logger.info({ chatId: targetId, mode: "interactive" }, "Activity boost sent");
     } else {
-      const resp = await withRetry(() => groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        messages: [
+      const boostMsg = await getAIResponse(
+        [
           { role: "system", content: SYSTEM_PROMPT_BASE },
           { role: "user", content: `[Чат затих. Напиши короткое живое сообщение от себя — вопрос, наблюдение, интересная тема или просто что-то, что разожжёт разговор. Не объявляй что ты "поднимаешь активность". Пиши как обычный участник. Максимум 1-2 предложения.]` },
         ],
-        max_tokens: 100,
-        temperature: 1.0,
-      }), { label: "activity boost" });
-
-      const boostMsg = resp.choices[0]?.message?.content?.trim();
+        { maxTokens: 100, temperature: 1.0, label: "activity boost" },
+      );
       if (boostMsg) {
         await bot.sendMessage(targetId, boostMsg).catch(() => {});
         recordBotActivity(targetId);
@@ -976,20 +970,14 @@ async function chat(userId: number, chatId: number, userText: string): Promise<s
 
   history.push({ role: "user", content: userText });
 
-  const completion = await withRetry(() => withTimeout(
-    groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [
-        { role: "system", content: systemPromptFor(userId, memory) },
-        ...history.slice(0, -1),
-        { role: "user", content: enrichedText },
-      ],
-      max_tokens: 512,
-    }),
-    30000, "chat"
-  ), { label: "chat" });
-
-  const rawReply = completion.choices[0]?.message?.content?.trim() ?? "извини, что-то пошло не так";
+  const rawReply = await getAIResponse(
+    [
+      { role: "system", content: systemPromptFor(userId, memory) },
+      ...history.slice(0, -1),
+      { role: "user", content: enrichedText },
+    ],
+    { maxTokens: 512, label: "chat" },
+  );
   const clean = await processTagsAndSend(chatId, rawReply);
   const finalText = clean || rawReply.replace(/\[.*?\]/g, "").trim() || "...";
 
@@ -1666,19 +1654,16 @@ async function runAutoModeration(msg: TelegramBot.Message): Promise<boolean> {
 
         // 1. Sam reacts in character in the group
         try {
-          const conflictReply = await withRetry(() => groq.chat.completions.create({
-            model: "llama-3.3-70b-versatile",
-            messages: [
+          const conflictText = await getAIResponse(
+            [
               { role: "system", content: SYSTEM_PROMPT_BASE },
               { role: "user", content: doAutoban
                 ? `[В чате разгорелся серьёзный конфликт. Агрессивного участника забанили. Напиши короткую реакцию от себя — спокойно, без лишних слов, как человек который устал от токсичности. Без восклицательных знаков, без официоза.]`
                 : `[В чате началась эскалация конфликта. Участника замутили на 30 минут. Напиши короткую реакцию — ты немного устал от этой атмосферы, предложи успокоиться. Живо, по-человечески, коротко.]`,
               },
             ],
-            max_tokens: 120,
-            temperature: 0.8,
-          }), { label: "conflict reply" });
-          const conflictText = conflictReply.choices[0]?.message?.content?.trim();
+            { maxTokens: 120, temperature: 0.8, label: "conflict reply" },
+          );
           if (conflictText) {
             await bot.sendMessage(chatId, conflictText).catch(() => {});
             recordBotActivity(chatId);
@@ -2022,13 +2007,13 @@ bot.onText(/^\/start(?:\s+(.+))?/, async (msg, match) => {
   const memory = await loadMemory(from?.id ?? chatId);
 
   if (memory.length > 0) {
-    const resp = await withRetry(() => groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [{ role: "system", content: systemPromptFor(from?.id ?? chatId, memory) },
-        { role: "user", content: `[Пользователь вернулся. Тёплое приветствие как старый друг. Коротко, без "!"]` }],
-      max_tokens: 150,
-    }), { label: "/start return" });
-    const greeting = resp.choices[0]?.message?.content?.trim();
+    const greeting = await getAIResponse(
+      [
+        { role: "system", content: systemPromptFor(from?.id ?? chatId, memory) },
+        { role: "user", content: `[Пользователь вернулся. Тёплое приветствие как старый друг. Коротко, без "!"]` },
+      ],
+      { maxTokens: 150, label: "/start return" },
+    ).catch(() => "");
     if (greeting) { await sendWithTyping(chatId, greeting); return; }
   }
   await sendWithTyping(chatId, `о, привет ${firstName}) я сэм, мне 17, могу просто поговорить или помочь с чем-то по группе\n\nпиши что хочешь, я тут`);
@@ -2068,9 +2053,8 @@ bot.onText(/^\/waifu(?:\s+(.+))?$/, async (msg, match) => {
   const hasCyrillic = /[а-яёА-ЯЁ]/.test(prompt);
   if (hasCyrillic) {
     try {
-      const translateRes = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        messages: [
+      finalPrompt = await getAIResponse(
+        [
           {
             role: "system",
             content:
@@ -2080,10 +2064,8 @@ bot.onText(/^\/waifu(?:\s+(.+))?$/, async (msg, match) => {
           },
           { role: "user", content: prompt },
         ],
-        max_tokens: 200,
-        temperature: 0.2,
-      });
-      finalPrompt = translateRes.choices[0]?.message.content?.trim() ?? prompt;
+        { maxTokens: 200, temperature: 0.2, label: "waifu translate" },
+      );
     } catch {
       // Если перевод упал — используем оригинал
     }
@@ -2467,17 +2449,13 @@ bot.on("new_chat_members", async (msg) => {
         ? `[${name} только что вошёл в групповой чат. Поприветствуй его тепло, как будто уже знаешь. Коротко, живо, без официоза.]`
         : `[${name} только что вступил в чат. Напиши уникальное персональное приветствие: тепло, коротко, по-человечески. Предложи освоиться, скажи что готов помочь и пообщаться. Не копируй шаблонные фразы.]`;
 
-      const resp = await withRetry(() => groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        messages: [
+      const greeting = await getAIResponse(
+        [
           { role: "system", content: systemCtx },
           { role: "user", content: prompt },
         ],
-        max_tokens: 150,
-        temperature: 0.9,
-      }), { label: "welcome" });
-
-      const greeting = resp.choices[0]?.message?.content?.trim();
+        { maxTokens: 150, temperature: 0.9, label: "welcome" },
+      );
       if (greeting) {
         await bot.sendMessage(chatId, greeting, {
           reply_markup: {
@@ -2523,17 +2501,14 @@ bot.on("sticker", async (msg) => {
   const key = convKey(chatId, msg.from.id);
   const history = conversations.get(key) ?? [];
 
-  const resp = await withRetry(() => groq.chat.completions.create({
-    model: "llama-3.3-70b-versatile",
-    messages: [
+  const reply = await getAIResponse(
+    [
       { role: "system", content: systemPromptFor(msg.from.id, memory) },
       ...history,
       { role: "user", content: `[стикер ${sticker.emoji ?? ""}${sticker.set_name ? ` из набора "${sticker.set_name}"` : ""}]` },
     ],
-    max_tokens: 80,
-  }), { label: "sticker reply" });
-
-  const reply = resp.choices[0]?.message?.content?.trim() ?? "хах)";
+    { maxTokens: 80, label: "sticker reply" },
+  ).catch(() => "хах)");
   history.push({ role: "user", content: `[стикер ${sticker.emoji ?? ""}]` });
   history.push({ role: "assistant", content: reply });
   conversations.set(key, history);
