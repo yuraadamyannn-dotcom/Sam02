@@ -114,5 +114,10 @@ python-telegram-bot==21.10, google-generativeai==0.8.5, openai==1.82.0, groq==0.
 - `DATABASE_URL` — PostgreSQL connection
 
 ## Runtime Notes
-- Main Telegram polling runs from `artifacts/api-server: API Server`; the fallback `Start application` workflow is configured with `BOT_POLLING=false` to avoid duplicate Telegram polling.
+- **Single workflow**: `Start application` is the ONLY workflow that runs the bot (`BOT_POLLING=true PORT=8080`). The `artifacts/api-server: API Server` artifact workflow is left stopped to avoid port conflicts. Never start both simultaneously.
 - The DB schema has been pushed with `pnpm --filter @workspace/db run push`; missing-table errors such as `user_memory` should not occur unless a new database is attached.
+
+## AI Router (`bot/ai_router.ts`)
+- Provider order: **Groq** (5 models: llama-3.3-70b-versatile → llama-3.1-8b-instant → gemma2-9b-it → llama3-70b-8192 → mixtral-8x7b-32768) → **Gemini 2.0 Flash** → **Grok/xAI**
+- Each Groq model has its own 2-minute cooldown; if one is rate-limited, the next model is tried automatically
+- The `chat()` function in `index.ts` catches all AI errors internally and returns an in-character fallback — the user never sees a raw error message

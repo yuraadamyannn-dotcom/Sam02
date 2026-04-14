@@ -970,14 +970,27 @@ async function chat(userId: number, chatId: number, userText: string): Promise<s
 
   history.push({ role: "user", content: userText });
 
-  const rawReply = await getAIResponse(
-    [
-      { role: "system", content: systemPromptFor(userId, memory) },
-      ...history.slice(0, -1),
-      { role: "user", content: enrichedText },
-    ],
-    { maxTokens: 512, label: "chat" },
-  );
+  let rawReply: string;
+  try {
+    rawReply = await getAIResponse(
+      [
+        { role: "system", content: systemPromptFor(userId, memory) },
+        ...history.slice(0, -1),
+        { role: "user", content: enrichedText },
+      ],
+      { maxTokens: 512, label: "chat" },
+    );
+  } catch (err) {
+    logger.error({ err }, "AI router: all providers failed");
+    // Return in-character fallback — never show a raw error to the user
+    const fallbacks = [
+      "голова немного гудит, напиши чуть позже",
+      "щас не могу думать нормально, попробуй через минуту",
+      "что-то я завис, спроси ещё раз",
+      "подожди немного, скоро вернусь",
+    ];
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)]!;
+  }
   const clean = await processTagsAndSend(chatId, rawReply);
   const finalText = clean || rawReply.replace(/\[.*?\]/g, "").trim() || "...";
 
@@ -2746,7 +2759,8 @@ bot.on("message", async (msg) => {
     if (reply?.trim()) await sendWithTyping(chatId, reply);
   } catch (err) {
     logger.error({ err }, "Private chat error");
-    await bot.sendMessage(chatId, "что-то пошло не так, попробуй ещё раз").catch(() => {});
+    // chat() handles AI errors internally — this is a last-resort catch (e.g. DB failure)
+    await bot.sendMessage(chatId, "завис на секунду, напиши ещё раз").catch(() => {});
   }
 });
 
