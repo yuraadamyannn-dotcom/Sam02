@@ -2608,11 +2608,11 @@ bot.onText(/^\/resource_stats(?:\s|$)/, async (msg) => {
   const qStats = messageQueue.getStats();
   const lines = [
     `⚙️ <b>ReplitOptimizer — ресурсы</b>`,
-    `Heap: <code>${stats["heapMb"]} MB / ${stats["heapTotalMb"]} MB (${stats["pct"]}%)</code>`,
-    `RSS: <code>${stats["rssMb"]} MB</code>`,
+    `RSS (процесс): <code>${stats["rssMb"]} MB</code> (порог ⚠️${stats["thresholdHighMb"]} / 🚨${stats["thresholdCriticalMb"]} MB)`,
+    `Heap: <code>${stats["heapMb"]} MB / ${stats["heapTotalMb"]} MB (${stats["heapPct"]}%)</code>`,
     `Аптайм: <code>${stats["uptimeH"]} ч</code>`,
-    `Высокая память: ${stats["highMemory"] ? "⚠️ да" : "✅ нет"}`,
-    `Критическая: ${stats["criticalMemory"] ? "🚨 да" : "✅ нет"}`,
+    `Высокая память (RSS): ${stats["highMemory"] ? "⚠️ да" : "✅ нет"}`,
+    `Критическая (RSS): ${stats["criticalMemory"] ? "🚨 да" : "✅ нет"}`,
     `Shutdown: ${stats["isShuttingDown"] ? "⚙️ в процессе" : "✅ нет"}`,
     ``,
     `📬 <b>MessageQueue</b>`,

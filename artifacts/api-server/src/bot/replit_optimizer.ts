@@ -32,8 +32,12 @@ export class ReplitOptimizer {
   private alertCb: ((msg: string) => void) | null = null;
   private lastHighMemAlert = 0;
 
-  private readonly HIGH_MEMORY_PCT = 0.70;    // 70% → clear soft caches
-  private readonly CRITICAL_MEMORY_PCT = 0.85; // 85% → kill non-critical tasks
+  // Absolute RSS thresholds (Replit typically has 512-1024 MB RAM)
+  // Using RSS (Resident Set Size) — reflects actual process footprint, not V8 heap ratio.
+  // heapUsed/heapTotal is unreliable: V8 starts with a small heapTotal (~130 MB) and
+  // grows it on demand, so pct can read 98% even when the process is perfectly healthy.
+  private readonly HIGH_MEMORY_RSS_MB = 380;    // ~380 MB RSS → soft GC
+  private readonly CRITICAL_MEMORY_RSS_MB = 480; // ~480 MB RSS → alert + hard GC
 
   start(opts: {
     selfPingUrl?: string;
@@ -77,23 +81,24 @@ export class ReplitOptimizer {
     const heapTotalMb = mem.heapTotal / 1024 / 1024;
     const rssMb = mem.rss / 1024 / 1024;
     const externalMb = mem.external / 1024 / 1024;
-    const pct = mem.heapUsed / mem.heapTotal;
+    // pct is for display only — not used for threshold decisions
+    const pct = heapTotalMb > 0 ? heapUsedMb / heapTotalMb : 0;
 
-    const highMemory = pct >= this.HIGH_MEMORY_PCT;
-    const criticalMemory = pct >= this.CRITICAL_MEMORY_PCT;
+    // ── Use RSS for threshold decisions (reliable; heapUsed/heapTotal is not) ─
+    const highMemory = rssMb >= this.HIGH_MEMORY_RSS_MB;
+    const criticalMemory = rssMb >= this.CRITICAL_MEMORY_RSS_MB;
 
     if (criticalMemory) {
-      logger.error({ heapUsedMb: Math.round(heapUsedMb), pct: (pct * 100).toFixed(0) }, "ReplitOptimizer: CRITICAL memory");
+      logger.error({ rssMb: Math.round(rssMb), heapUsedMb: Math.round(heapUsedMb) }, "ReplitOptimizer: CRITICAL memory (RSS)");
       this.onCriticalMemoryCb?.();
-      // Force GC if available
       if (global.gc) global.gc();
       const now = Date.now();
-      if (now - this.lastHighMemAlert > 15 * 60_000) {
+      if (now - this.lastHighMemAlert > 30 * 60_000) { // alert at most every 30 min
         this.lastHighMemAlert = now;
-        this.alertCb?.(`🚨 <b>ReplitOptimizer: КРИТИЧЕСКАЯ память</b>\nHeap: <code>${Math.round(heapUsedMb)} MB / ${Math.round(heapTotalMb)} MB (${(pct * 100).toFixed(0)}%)</code>\nRSS: <code>${Math.round(rssMb)} MB</code>\nДействие: принудительный GC + очистка кэшей.`);
+        this.alertCb?.(`🚨 <b>ReplitOptimizer: высокое потребление RAM</b>\nRSS: <code>${Math.round(rssMb)} MB</code> (порог ${this.CRITICAL_MEMORY_RSS_MB} MB)\nHeap: <code>${Math.round(heapUsedMb)} MB / ${Math.round(heapTotalMb)} MB</code>\nДействие: GC + очистка кэшей. Проверь /resource_stats`);
       }
     } else if (highMemory) {
-      logger.warn({ heapUsedMb: Math.round(heapUsedMb), pct: (pct * 100).toFixed(0) }, "ReplitOptimizer: high memory");
+      logger.warn({ rssMb: Math.round(rssMb), heapUsedMb: Math.round(heapUsedMb) }, "ReplitOptimizer: high memory (RSS)");
       this.onHighMemoryCb?.();
       if (global.gc) global.gc();
     }
@@ -159,7 +164,9 @@ export class ReplitOptimizer {
       heapMb: Math.round(status.memory.heapUsedMb),
       heapTotalMb: Math.round(status.memory.heapTotalMb),
       rssMb: Math.round(status.memory.rssMb),
-      pct: (status.memory.pct * 100).toFixed(1),
+      heapPct: (status.memory.pct * 100).toFixed(1),
+      thresholdHighMb: this.HIGH_MEMORY_RSS_MB,
+      thresholdCriticalMb: this.CRITICAL_MEMORY_RSS_MB,
       uptimeH: (status.uptimeSeconds / 3600).toFixed(1),
       highMemory: status.highMemory,
       criticalMemory: status.criticalMemory,
