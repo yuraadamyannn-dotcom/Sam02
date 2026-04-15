@@ -64,6 +64,8 @@ import {
   isWhitelisted, detectMassModAction, executeMassModAction,
 } from "./engagement";
 import { detectWhisper, handleWhisper, handleWhisperCallback, isWhisperCommand } from "./whisper";
+import { hybridMemory } from "./hybrid_memory";
+import { codeGuardian } from "./code_guardian";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
@@ -79,6 +81,8 @@ const BOT_POLLING = process.env["BOT_POLLING"] === "true";
 const bot = new TelegramBot(token, { polling: BOT_POLLING });
 const groq = new Groq({ apiKey: groqKey });
 const eleven = elevenKey ? new ElevenLabsClient({ apiKey: elevenKey }) : null;
+hybridMemory.start();
+codeGuardian.start(bot);
 
 // Bot identity — resolved async once on startup
 let BOT_ID = 0;
@@ -103,8 +107,8 @@ process.on("unhandledRejection", (reason) => {
 });
 
 // ─── Deduplication guard — prevents double-response when Telegram re-delivers ──
-const processedMsgIds = new Set<number>();
-function markProcessed(msgId: number): boolean {
+const processedMsgIds = new Set<string>();
+function markProcessed(msgId: string): boolean {
   if (processedMsgIds.has(msgId)) return false;
   processedMsgIds.add(msgId);
   if (processedMsgIds.size > 2000) {
@@ -162,12 +166,11 @@ async function claimCommandMessage(msg: TelegramBot.Message): Promise<boolean> {
 const originalOnText = bot.onText.bind(bot);
 bot.onText = ((regexp, callback) => {
   return originalOnText(regexp, (msg, match) => {
-    void (async () => {
+    void codeGuardian.runHandler(`command:${String(regexp)}`, msg, async () => {
+      if (codeGuardian.shouldIgnoreMessage(msg, BOT_ID)) return;
       if (!(await claimCommandMessage(msg))) return;
       await callback(msg, match);
-    })().catch((err) => {
-      logger.error({ err, regexp: String(regexp), chatId: msg.chat.id, messageId: msg.message_id }, "Command handler failed");
-    });
+    }, bot);
   });
 }) as TelegramBot["onText"];
 
@@ -464,7 +467,9 @@ async function sendWithTyping(chatId: number, text: string, opts?: TelegramBot.S
     await bot.sendChatAction(chatId, "typing").catch(() => {});
     await sleep(Math.min(chunkSize, delay - i * chunkSize));
   }
-  await bot.sendMessage(chatId, text, opts).catch((err) => {
+  await bot.sendMessage(chatId, text, opts).then(() => {
+    codeGuardian.recordBotReply(chatId, undefined, opts?.reply_to_message_id);
+  }).catch((err) => {
     logger.error({ err, chatId }, "sendMessage failed");
   });
 }
@@ -837,12 +842,13 @@ async function trackUser(from: TelegramBot.User): Promise<void> {
 async function loadMemory(userId: number): Promise<string> {
   try {
     const [row] = await db.select().from(userMemoryTable).where(eq(userMemoryTable.userId, userId));
-    if (!row) return "";
     const parts: string[] = [];
-    if (row.name) parts.push(`Имя/ник: ${row.name}`);
-    if (row.interests) parts.push(`Интересы: ${row.interests}`);
-    if (row.summary) parts.push(`Кто он: ${row.summary}`);
-    if (row.notes) parts.push(`Важные детали: ${row.notes}`);
+    if (row?.name) parts.push(`Имя/ник: ${row.name}`);
+    if (row?.interests) parts.push(`Интересы: ${row.interests}`);
+    if (row?.summary) parts.push(`Кто он: ${row.summary}`);
+    if (row?.notes) parts.push(`Важные детали: ${row.notes}`);
+    const profile = await hybridMemory.get_profile(userId).catch(() => null);
+    if (profile) parts.push(`Гибридный профиль: ${JSON.stringify(profile).slice(0, 900)}`);
     return parts.length ? `\n\n[ПАМЯТЬ О ПОЛЬЗОВАТЕЛЕ]\n${parts.join("\n")}` : "";
   } catch { return ""; }
 }
@@ -873,6 +879,12 @@ async function updateMemoryBackground(userId: number, history: ChatMessage[]): P
         notes: parsed.notes || existing?.notes || null,
         lastUpdated: new Date(),
       },
+    });
+    await hybridMemory.update_profile(userId, {
+      name: parsed.name || existing?.name || null,
+      interests: parsed.interests || existing?.interests || null,
+      summary: parsed.summary || existing?.summary || null,
+      notes: parsed.notes || existing?.notes || null,
     });
   } catch (err) { logger.error({ err }, "Memory update failed"); }
 }
@@ -1021,7 +1033,10 @@ function isMusicRequest(text: string): string | null {
 // ─── Main chat ────────────────────────────────────────────────────────────────
 
 async function chat(userId: number, chatId: number, userText: string): Promise<string> {
-  const memory = await loadMemory(userId);
+  const [memory, hybridContext] = await Promise.all([
+    loadMemory(userId),
+    hybridMemory.buildContext(userId, chatId, userText).catch(() => ""),
+  ]);
   const key = convKey(chatId, userId);
   const history = conversations.get(key) ?? [];
 
@@ -1050,12 +1065,13 @@ async function chat(userId: number, chatId: number, userText: string): Promise<s
   }
 
   history.push({ role: "user", content: userText });
+  void hybridMemory.remember(userId, chatId, userText, "dialog").catch(err => codeGuardian.recordIntegrationError("hybrid_memory_remember_user", err));
 
   let rawReply: string;
   try {
     rawReply = await getAIResponse(
       [
-        { role: "system", content: systemPromptFor(userId, memory) },
+        { role: "system", content: systemPromptFor(userId, memory + hybridContext) },
         ...history.slice(0, -1),
         { role: "user", content: enrichedText },
       ],
@@ -1087,6 +1103,7 @@ async function chat(userId: number, chatId: number, userText: string): Promise<s
   history.push({ role: "assistant", content: finalText });
   if (history.length > 30) history.splice(0, 2);
   conversations.set(key, history);
+  void hybridMemory.remember(userId, chatId, finalText, "dialog").catch(err => codeGuardian.recordIntegrationError("hybrid_memory_remember_assistant", err));
   void updateMemoryBackground(userId, history);
   return finalText;
 }
@@ -2427,6 +2444,20 @@ bot.onText(/^\/status(?:\s|$)/, async (msg) => {
   await bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
 });
 
+bot.onText(/^\/memory_stats(?:\s|$)/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const stats = hybridMemory.getStats();
+  const codeStats = codeGuardian.getStats();
+  const text = [
+    `🧠 <b>Гибридная память</b>`,
+    `<pre>${escapeHtml(JSON.stringify(stats, null, 2)).slice(0, 2800)}</pre>`,
+    ``,
+    `🛡 <b>CodeGuardian</b>`,
+    `<pre>${escapeHtml(JSON.stringify(codeStats, null, 2)).slice(0, 1200)}</pre>`,
+  ].join("\n");
+  await bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
+});
+
 // /danni
 bot.onText(/^\/danni(?:_chat)?(\s+.*)?$/, async (msg, match) => {
   if (!isOwner(msg.from?.id ?? 0)) {
@@ -2882,10 +2913,11 @@ bot.on("video_note", async (msg) => {
 // ─── Main message handler ─────────────────────────────────────────────────────
 
 bot.on("message", async (msg) => {
-  if (!markProcessed(msg.message_id)) return;
+  if (!await codeGuardian.claimUpdate(`message:${msg.chat.id}:${msg.message_id}`, { chatId: msg.chat.id, messageId: msg.message_id, userId: msg.from?.id })) return;
+  if (!markProcessed(`${msg.chat.id}:${msg.message_id}`)) return;
   if (!msg.text || msg.text.startsWith("/")) return;
   if (msg.photo || msg.video || msg.video_note || msg.sticker || msg.voice) return;
-  if (!msg.from || msg.from.is_bot) return;
+  if (!msg.from || codeGuardian.shouldIgnoreMessage(msg, BOT_ID)) return;
 
   const chatId = msg.chat.id;
   const from = msg.from;

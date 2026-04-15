@@ -116,6 +116,8 @@ python-telegram-bot==21.10, google-generativeai==0.8.5, openai==1.82.0, groq==0.
 ## Runtime Notes
 - **Single workflow**: `Start application` is the ONLY workflow that runs the bot (`BOT_POLLING=true PORT=8080`). The `artifacts/api-server: API Server` artifact workflow is left stopped to avoid port conflicts. Never start both simultaneously.
 - The DB schema has been pushed with `pnpm --filter @workspace/db run push`; missing-table errors such as `user_memory` should not occur unless a new database is attached.
+- Hybrid memory added in `bot/hybrid_memory.ts`: SQLite guardian prefers `/mnt/data/memory_guardian.db` and falls back to workspace `.data/memory_guardian.db` if `/mnt/data` is unavailable; Qdrant hot memory and Zilliz cold memory activate automatically when `QDRANT_URL`, `QDRANT_API_KEY`, `ZILLIZ_URL`, and `ZILLIZ_API_KEY` are set. Optional `OPENAI_API_KEY` enables `text-embedding-3-small`; without it the bot uses local 384-dimension hash embeddings and keeps working.
+- Self-healing added in `bot/code_guardian.ts`: SQLite state prefers `/mnt/data/code_guardian.db` and falls back to workspace `.data/code_guardian.db`, with processed-update dedupe, bot-loop filtering, handler exception capture, memory pressure monitoring, integration error counters, and owner alerts. Owner command `/memory_stats` shows memory and guardian status.
 
 ## AI Router (`bot/ai_router.ts`)
 - Provider order: **Groq** (5 models: llama-3.3-70b-versatile → llama-3.1-8b-instant → gemma2-9b-it → llama3-70b-8192 → mixtral-8x7b-32768) → **Gemini 2.0 Flash** → **Grok/xAI**
