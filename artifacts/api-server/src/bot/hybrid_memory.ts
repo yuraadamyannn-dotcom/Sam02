@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import OpenAI from "openai";
@@ -61,6 +61,12 @@ function resolveSqlitePath(requestedPath: string): string {
     logger.warn({ err, requestedPath, fallback }, "SQLite guardian path unavailable, using workspace fallback");
     return fallback;
   }
+}
+
+function normaliseBaseUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
 function hashEmbedding(text: string, dimensions = 384): number[] {
@@ -195,10 +201,33 @@ export class MemoryGuardian {
       CREATE TABLE IF NOT EXISTS metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, component TEXT NOT NULL, operation TEXT NOT NULL, latency_ms INTEGER NOT NULL, ok INTEGER NOT NULL, error TEXT, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS request_cache (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, created_at TEXT NOT NULL, last_access TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS memory_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, message TEXT NOT NULL, meta_json TEXT, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS distributed_locks (resource_id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_dialog_buffer_chat_ts ON dialog_buffer(chat_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_dialog_buffer_user_ts ON dialog_buffer(user_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_sync_queue_target ON sync_queue(target, created_at);
     `);
+  }
+
+  async withLock<T>(resourceId: string, work: () => Promise<T>, timeoutMs = 10_000): Promise<T> {
+    const owner = randomUUID();
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      this.db.prepare("DELETE FROM distributed_locks WHERE expires_at < ?").run(Date.now());
+      const result = this.db.prepare("INSERT OR IGNORE INTO distributed_locks (resource_id, owner, expires_at, created_at) VALUES (?, ?, ?, ?)")
+        .run(resourceId, owner, Date.now() + 30_000, nowIso());
+      if (result.changes === 1) {
+        const started = Date.now();
+        try {
+          return await work();
+        } finally {
+          const elapsed = Date.now() - started;
+          if (elapsed > 5000) this.log("warn", "long distributed lock", { resourceId, elapsed });
+          this.db.prepare("DELETE FROM distributed_locks WHERE resource_id = ? AND owner = ?").run(resourceId, owner);
+        }
+      }
+      await sleep(100);
+    }
+    throw new Error(`lock timeout: ${resourceId}`);
   }
 
   setState(key: string, value: unknown): void {
@@ -254,6 +283,19 @@ export class MemoryGuardian {
       .run(component, operation, Math.round(latencyMs), ok ? 1 : 0, error ? String(error) : null, nowIso());
   }
 
+  log(level: string, message: string, meta: Record<string, unknown> = {}): void {
+    this.db.prepare("INSERT INTO memory_logs (level, message, meta_json, created_at) VALUES (?, ?, ?, ?)")
+      .run(level, message, JSON.stringify(meta), nowIso());
+  }
+
+  getDbSizeBytes(): number {
+    try {
+      return existsSync(this.dbPath) ? statSync(this.dbPath).size : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   getStats(): Record<string, unknown> {
     const sync = this.db.prepare("SELECT COUNT(*) AS count FROM sync_queue").get() as { count: number };
     const buffered = this.db.prepare("SELECT COUNT(*) AS count FROM dialog_buffer WHERE synced = 0").get() as { count: number };
@@ -278,14 +320,17 @@ export class MemoryGuardian {
 
 export class HybridMemory {
   private guardian = new MemoryGuardian();
-  private qdrant = new ResilientClient("qdrant", process.env["QDRANT_URL"] ?? "", process.env["QDRANT_API_KEY"] ?? "");
-  private zilliz = new ResilientClient("zilliz", process.env["ZILLIZ_URL"] ?? "", process.env["ZILLIZ_API_KEY"] ?? "");
+  private qdrant = new ResilientClient("qdrant", normaliseBaseUrl(process.env["QDRANT_URL"] ?? ""), process.env["QDRANT_API_KEY"] ?? "");
+  private zilliz = new ResilientClient("zilliz", normaliseBaseUrl(process.env["ZILLIZ_URL"] ?? process.env["ZILLIZ_URI"] ?? ""), process.env["ZILLIZ_API_KEY"] ?? process.env["ZILLIZ_TOKEN"] ?? "");
   private openai = process.env["OPENAI_API_KEY"] ? new OpenAI({ apiKey: process.env["OPENAI_API_KEY"] }) : null;
   private pending: Array<{ entry: MemoryEntry; vector: number[] }> = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private migrationTimer: ReturnType<typeof setInterval> | null = null;
+  private autoscaleTimer: ReturnType<typeof setInterval> | null = null;
   private profileHotCache = new Map<number, { data: Record<string, unknown>; expiresAt: number }>();
+  private economyMode = false;
+  private sqliteOnly = false;
 
   start(): void {
     this.guardian.startHealthLoop([this.qdrant, this.zilliz]);
@@ -301,16 +346,23 @@ export class HybridMemory {
       this.migrationTimer = setInterval(() => void this.migrateColdData().catch(err => logger.error({ err }, "Memory migration failed")), 6 * 60 * 60_000);
       this.migrationTimer.unref?.();
     }
+    if (!this.autoscaleTimer) {
+      this.autoscaleTimer = setInterval(() => void this.autoscale().catch(err => logger.warn({ err }, "Memory autoscaler failed")), 10 * 60_000);
+      this.autoscaleTimer.unref?.();
+      setTimeout(() => void this.autoscale().catch(err => logger.warn({ err }, "Startup memory autoscaler failed")), 15_000).unref?.();
+    }
   }
 
   async remember(userId: number, chatId: number, text: string, type: MemoryType = "dialog"): Promise<void> {
     const trimmed = text.trim();
     if (!trimmed) return;
-    const entry: MemoryEntry = { id: randomUUID(), userId, chatId, text: trimmed.slice(0, 4000), type, timestamp: Date.now() };
-    const vector = await this.embed(trimmed);
-    this.guardian.bufferDialog(entry, vector, false);
-    this.pending.push({ entry, vector });
-    if (this.pending.length >= 10) await this.flushBatch();
+    await this.guardian.withLock(`memory:user:${userId}`, async () => {
+      const entry: MemoryEntry = { id: randomUUID(), userId, chatId, text: trimmed.slice(0, 4000), type, timestamp: Date.now() };
+      const vector = await this.embed(trimmed);
+      this.guardian.bufferDialog(entry, vector, false);
+      this.pending.push({ entry, vector });
+      if (this.pending.length >= 10) await this.flushBatch();
+    });
   }
 
   async recall(userId: number, chatId: number, query?: string, limit = 5): Promise<MemoryEntry[]> {
@@ -352,16 +404,18 @@ export class HybridMemory {
   }
 
   async update_profile(userId: number, data: Record<string, unknown>): Promise<void> {
-    const payload = { user_id: userId, ...data, updated_at: nowIso() };
-    this.guardian.cacheProfile(userId, payload);
-    this.profileHotCache.set(userId, { data: payload, expiresAt: Date.now() + 5 * 60_000 });
-    if (!this.zilliz.configured || this.zilliz.status === "dead") {
-      this.guardian.enqueue("zilliz", "update_profile", payload);
-      return;
-    }
-    await this.writeZilliz("user_profiles", [{ id: String(userId), vector: await this.embed(JSON.stringify(payload)), payload }]).catch(err => {
-      this.guardian.enqueue("zilliz", "update_profile", payload);
-      logger.warn({ err, userId }, "Profile write queued after Zilliz failure");
+    await this.guardian.withLock(`profile:${userId}`, async () => {
+      const payload = { user_id: userId, ...data, updated_at: nowIso() };
+      this.guardian.cacheProfile(userId, payload);
+      this.profileHotCache.set(userId, { data: payload, expiresAt: Date.now() + 5 * 60_000 });
+      if (!this.zilliz.configured || this.zilliz.status === "dead" || this.sqliteOnly) {
+        this.guardian.enqueue("zilliz", "update_profile", payload);
+        return;
+      }
+      await this.writeZilliz("user_profiles", [{ id: String(userId), vector: await this.embed(JSON.stringify(payload)), payload }]).catch(err => {
+        this.guardian.enqueue("zilliz", "update_profile", payload);
+        logger.warn({ err, userId }, "Profile write queued after Zilliz failure");
+      });
     });
   }
 
@@ -379,7 +433,7 @@ export class HybridMemory {
   }
 
   getStats(): Record<string, unknown> {
-    return { guardian: this.guardian.getStats(), qdrant: this.qdrant.getMetrics(), zilliz: this.zilliz.getMetrics(), embeddingDimensions: EMBEDDING_DIM, pendingBatch: this.pending.length };
+    return { guardian: this.guardian.getStats(), qdrant: this.qdrant.getMetrics(), zilliz: this.zilliz.getMetrics(), embeddingDimensions: EMBEDDING_DIM, pendingBatch: this.pending.length, economyMode: this.economyMode, sqliteOnly: this.sqliteOnly, sqliteBytes: this.guardian.getDbSizeBytes() };
   }
 
   private async embed(text: string): Promise<number[]> {
@@ -410,7 +464,7 @@ export class HybridMemory {
       }
     }
     for (const [chatId, points] of byChat) {
-      if (!this.qdrant.configured || this.qdrant.status === "dead") {
+      if (!this.qdrant.configured || this.qdrant.status === "dead" || this.sqliteOnly) {
         for (const p of points) this.guardian.enqueue("qdrant", "upsert_dialog", { chatId, ...p });
       } else {
         await this.writeQdrant(`active_dialogs_${chatId}`, points).catch(err => {
@@ -420,7 +474,7 @@ export class HybridMemory {
       }
     }
     if (archive.length) {
-      if (!this.zilliz.configured || this.zilliz.status === "dead") {
+      if (!this.zilliz.configured || this.zilliz.status === "dead" || this.sqliteOnly) {
         for (const p of archive) this.guardian.enqueue("zilliz", "archive", p);
       } else {
         await this.writeZilliz("archive_data", archive).catch(err => {
@@ -496,6 +550,37 @@ export class HybridMemory {
     const candidates = this.guardian.getDialogBuffer(0, 3650, 0);
     void candidates;
     logger.debug({ hotDays: HOT_DAYS }, "Hybrid memory cold migration tick");
+  }
+
+  private async autoscale(): Promise<void> {
+    const sqliteMb = this.guardian.getDbSizeBytes() / 1024 / 1024;
+    const qdrantQuota = Number(process.env["QDRANT_QUOTA_MB"] ?? 1000);
+    const zillizQuota = Number(process.env["ZILLIZ_QUOTA_MB"] ?? 5000);
+    const qdrantLatency = this.qdrant.getMetrics().latencyMs;
+    const zillizLatency = this.zilliz.getMetrics().latencyMs;
+    const latency = Math.max(qdrantLatency, zillizLatency);
+    if (latency > 200) {
+      this.guardian.log("warn", "vector search latency high", { latency, qdrantLatency, zillizLatency });
+    }
+    if (sqliteMb > 70) {
+      this.economyMode = true;
+      this.guardian.log("warn", "SQLite guardian approaching soft limit", { sqliteMb });
+    }
+    if (sqliteMb > 95) {
+      this.sqliteOnly = true;
+      this.guardian.log("error", "SQLite guardian near hard limit, external writes paused", { sqliteMb });
+    }
+    if (qdrantQuota <= 0 || zillizQuota <= 0) return;
+    this.guardian.setState("autoscaler", {
+      sqliteMb,
+      qdrantQuota,
+      zillizQuota,
+      qdrantStatus: this.qdrant.getMetrics().status,
+      zillizStatus: this.zilliz.getMetrics().status,
+      economyMode: this.economyMode,
+      sqliteOnly: this.sqliteOnly,
+      updatedAt: nowIso(),
+    });
   }
 }
 

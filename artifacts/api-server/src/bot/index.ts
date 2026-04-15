@@ -168,6 +168,7 @@ bot.onText = ((regexp, callback) => {
   return originalOnText(regexp, (msg, match) => {
     void codeGuardian.runHandler(`command:${String(regexp)}`, msg, async () => {
       if (codeGuardian.shouldIgnoreMessage(msg, BOT_ID)) return;
+      if (!(await codeGuardian.allowMessage(msg, bot, isOwner(msg.from?.id ?? 0)))) return;
       if (!(await claimCommandMessage(msg))) return;
       await callback(msg, match);
     }, bot);
@@ -2433,6 +2434,8 @@ bot.onText(/^\/status(?:\s|$)/, async (msg) => {
   const uptime = Math.floor(process.uptime());
   const h = Math.floor(uptime / 3600);
   const m = Math.floor((uptime % 3600) / 60);
+  const memoryStats = hybridMemory.getStats();
+  const guardianStats = codeGuardian.getStats();
   const text = [
     `🤖 <b>Статус бота</b>`,
     `⏱ Аптайм: ${h}ч ${m}м`,
@@ -2440,6 +2443,9 @@ bot.onText(/^\/status(?:\s|$)/, async (msg) => {
     `🔊 ElevenLabs: ${eleven ? "✅" : "❌"}`,
     `🧠 Groq: ✅`,
     `🗃 DB: ✅`,
+    `🧬 Qdrant: ${escapeHtml(String((memoryStats as any).qdrant?.status ?? "unknown"))}`,
+    `🧊 Zilliz: ${escapeHtml(String((memoryStats as any).zilliz?.status ?? "unknown"))}`,
+    `🛡 Guardian: ${escapeHtml(JSON.stringify({ recentErrors: (guardianStats as any).recentErrors, rateLimiter: (guardianStats as any).rateLimiter }).slice(0, 900))}`,
   ].join("\n");
   await bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
 });
@@ -2456,6 +2462,21 @@ bot.onText(/^\/memory_stats(?:\s|$)/, async (msg) => {
     `<pre>${escapeHtml(JSON.stringify(codeStats, null, 2)).slice(0, 1200)}</pre>`,
   ].join("\n");
   await bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
+});
+
+bot.onText(/^\/analyze(?:\s|$)/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const findings = codeGuardian.runAnalysisNow();
+  const body = findings.length
+    ? findings.slice(0, 20).map(f => `${f.severity} ${f.code} ${f.file}:${f.line ?? 0} — ${f.message}`).join("\n")
+    : "проблем не найдено";
+  await bot.sendMessage(msg.chat.id, `🧪 <b>CodeAnalyzer</b>\n<pre>${escapeHtml(body).slice(0, 3200)}</pre>`, { parse_mode: "HTML" });
+});
+
+bot.onText(/^\/rollback(?:\s+(\S+))?/, async (msg, match) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const ok = codeGuardian.rollbackLastFix(match?.[1]);
+  await bot.sendMessage(msg.chat.id, ok ? "rollback выполнен" : "не нашёл патч для отката", { reply_to_message_id: msg.message_id });
 });
 
 // /danni
@@ -2918,6 +2939,7 @@ bot.on("message", async (msg) => {
   if (!msg.text || msg.text.startsWith("/")) return;
   if (msg.photo || msg.video || msg.video_note || msg.sticker || msg.voice) return;
   if (!msg.from || codeGuardian.shouldIgnoreMessage(msg, BOT_ID)) return;
+  if (!(await codeGuardian.allowMessage(msg, bot, isOwner(msg.from.id)))) return;
 
   const chatId = msg.chat.id;
   const from = msg.from;
