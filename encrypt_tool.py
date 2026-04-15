@@ -29,8 +29,8 @@ KEYS = [
     ("QDRANT_API_KEY",      "Qdrant API Key (optional)", False),
     ("ZILLIZ_URL",          "Zilliz URL (cold vector memory, optional)", False),
     ("ZILLIZ_API_KEY",      "Zilliz API Key (optional)", False),
-    ("SESSION_SECRET",      "Express Session Secret (random string)", False),
-    ("DATABASE_URL",        "PostgreSQL Database URL", True),
+    ("SESSION_SECRET",      "Express Session Secret (random string, optional)", False),
+    ("DATABASE_URL",        "PostgreSQL Database URL (optional)", False),
     ("REPLIT_API_TOKEN",    "Replit API Token (needed by decrypt_setup.py to auto-set secrets)", False),
     ("SPARE_KEY_15",        "Spare slot — any extra key you want to bundle", False),
 ]
