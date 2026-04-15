@@ -1,0 +1,35 @@
+============================================================
+  Sam Bot — Encrypted Config Tool
+============================================================
+
+=== API Key Collection ===
+Press Enter to skip optional keys.
+
+  [required] Telegram Bot Token (from @BotFather)
+        TELEGRAM_BOT_TOKEN:   [required] Groq API Key (primary AI engine)
+        GROQ_API_KEY:   [required] Gemini API Key (Python bot primary AI)
+        GEMINI_API_KEY:   [required] Admin Telegram User ID (your numeric Telegram ID)
+        ADMIN_TELEGRAM_ID:   [optional] ElevenLabs API Key (TTS voice, optional)
+        ELEVENLABS_API_KEY:   [optional] OpenAI API Key (embeddings, optional)
+        OPENAI_API_KEY:   [optional] Qdrant URL (vector DB, optional)
+        QDRANT_URL:   [optional] Qdrant API Key (optional)
+        QDRANT_API_KEY:   [optional] Zilliz URL (cold vector memory, optional)
+        ZILLIZ_URL:   [optional] Zilliz API Key (optional)
+        ZILLIZ_API_KEY:   [optional] Express Session Secret (random string, optional)
+        SESSION_SECRET:   [optional] PostgreSQL Database URL (optional)
+        DATABASE_URL:   [optional] Replit API Token (needed by decrypt_setup.py to auto-set secrets)
+        REPLIT_API_TOKEN:   [optional] Spare slot — any extra key you want to bundle
+        SPARE_KEY_15: 
+=== Master Password ===
+This password is used to encrypt your keys.
+Keep it safe — you'll need it to decrypt.
+
+
+============================================================
+  ENCRYPTED BLOB (copy everything between the lines)
+============================================================
+-DfEIXvkhufKXcp0SJpWlWdBQUFBQUJwMzI2aUZZZFFwakRlT1JzbTFoSWpUd1lCY0JOV2FaNEM0MllXb0UzRWczWFkxRURWdllkSVg2SU1zZVBIX1h2MXFXZDY5bFVTSUVNZk1vNmRIYU10QWFFSVVqbkNIUU1oaVM4SFNRUkdsTnlnUkJZaXNFblFZdUxMT1V0bldRRWhYNGp3NkEtS3FoaExFRkRjcFpZa2Q1Z2JuRHdnVXFLVjZvWEhfZjlmd2RBNnlLNTJjUlRlN2JqUjc5RzdZTHhBWGFTaHBoN29Rb2hjSk5tRHlsa2s1Q1dwdEFuNFRlZzdrVVU0Y3hzLVAtYUFZWkZVZG5ObGtXT1NvM1ZjbVFNOHJhV1JsNUFzaHhwMVhYV3BaTzh2amptZEJCY0VURlVxdnhwTWtzdXBLOEZWRmtGcy14dUdWcjRhZ0dKUFJ2dWZxajFuVVNjY2tYMFR0eU1IZzZYVFdhdWFhaHlhZmZsQS1NVUlpZEhwTDF3NGRScXo1Mk11cy1LT0xLYmlHTWRfbVlTNTNzNlBrVmdoWEd5N2U1eDNDOUNid0tLbGlVN1FUaGJOXzdZS3p2QmsyQlFGOTBTZm5EWThQWXpKcGhveU9IVVItR0x0VnZvR3hMLWI4MnBGOFN0enBVdVZoQWdrc01oQ0JaX3ZOaXM2OHVwQ1BmeG9XTDRPbjBOQmk5TmFwRDJkQjVJWVhXN2ZXLXJIZU5WOEJ5QXVKS1dIMzdZeGltYWVFakd5dHJxNkljWWJfbzVrRHk1Q3RISkdrbXNTQ3BkMkdsRmtZbU1FT2loUF9CUmpWd2FYbmNKNFZIUWZXUTNZQ2o2TUFmTllRVU1GTHhramZVcDZWVHpHR0xrWVdjTFpkWHR4UUprXzFsS3RIODZQNElkbnEtMUVLUExNdkdJMW5DM3pfdExLaXYxY3QwR0w5ZnU2dmRmc01lYUtBdHBPMWdsS1pfelZZTHFRcGFaa0NiNTZSZEc1LUlHYWpMUDFreU1ZaGVnNG1iQTZKUXlydllwQmxWaHVyai1VdEpWVXM5eGZONWk5cXVqMXdxVmJHYk1VVGx0NHVJYl93c0tEQlhLN3ZNVmJuck9ta2dGRFRSVkxXUGxicEdwUUYzMlpoaXBXbEpkdXZKNTBfeHJkcnFLdUR2ZnVpWW12LVJFaWdHVm9GVDEza2Y5QTl2ZUdKTXJPZlFHZUNGVjBLaTdXYXFNdDhueXJERVpJbndza3A5eTdPbU1uS0FBR3lpUXFpZ1ZkVkFGOTdnVHZTalpQc2dtaFVKd2tfajE1STUzX29NWFdEUWtNcnNuSEtPR0tCVEVvSTBaRWxHZ2JLUEIta0x0WmFJSHI4MDg3UUYtOElIbDBWMU5KbWdxeUViU1pXN21ZT0loWTZ0R2NJYmlTeUt3SjNuOTVGa0tKTnI1UXd6bTQza0t6LUtKTHR4QUNwbVp4VTl4ME90cVVhbTRqLU12MjZWQ2FrR3AwNnFDbWhqck1qQ054OWNqUkZwS1psRzlJWXhUY0tkMTlyTWd0ZWFnRUdkaWk0QjYwUkJLbllIM1RHSHhIN21SN0lXTzQ4RXAzNUZRZHRQOUxObDBTbEx3OWFCdnVjM2dHdG5BS2NvZlU3ZXdkZlVDZ3ZnVmRRb2o1cUNJaWgtbTU3bEdOcXlRM1Rzc1lFdGFYNzFpZVVEMEtWMV90QkI5STZJNmNYTllwZWVmTVpRblpMbHhabUFPZ2MxODVsVTh2ZlZBU1lUNENhV1lmTzNPQkhESks1ZV9zSVlpeEwtOTVVT0FMRXNMS2NBSUtVRmZKMHRMazJLalo3ZWllRFpnc1piOGJCUk9tZWc9PQ==
+============================================================
+
+Keys bundled: ['TELEGRAM_BOT_TOKEN', 'GROQ_API_KEY', 'GEMINI_API_KEY', 'ADMIN_TELEGRAM_ID', 'ELEVENLABS_API_KEY', 'OPENAI_API_KEY', 'QDRANT_URL', 'QDRANT_API_KEY', 'ZILLIZ_URL', 'ZILLIZ_API_KEY']
+Share this blob freely — it is useless without the password.
