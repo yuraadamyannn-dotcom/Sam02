@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { logger } from "../lib/logger";
+import { AutoScaler } from "./predictive_guard";
 
 export type MemoryType = "dialog" | "song" | "profile" | "old_dialog" | "event" | "voice_transcript" | string;
 
@@ -296,6 +297,18 @@ export class MemoryGuardian {
     }
   }
 
+  estimateExternalStorageMb(): { qdrantMb: number; zillizMb: number } {
+    // Each vector point ≈ 2 KB (vector float32 array + payload + index overhead)
+    const BYTES_PER_POINT = 2048;
+    const dialogCount = (this.db.prepare("SELECT COUNT(*) AS count FROM dialog_buffer").get() as { count: number }).count;
+    const profileCount = (this.db.prepare("SELECT COUNT(*) AS count FROM profile_cache").get() as { count: number }).count;
+    // Qdrant holds active dialogs
+    const qdrantMb = (dialogCount * BYTES_PER_POINT) / (1024 * 1024);
+    // Zilliz holds profiles + archived dialogs (estimate 20% of dialogs are archive)
+    const zillizMb = ((profileCount + Math.floor(dialogCount * 0.2)) * BYTES_PER_POINT) / (1024 * 1024);
+    return { qdrantMb, zillizMb };
+  }
+
   getStats(): Record<string, unknown> {
     const sync = this.db.prepare("SELECT COUNT(*) AS count FROM sync_queue").get() as { count: number };
     const buffered = this.db.prepare("SELECT COUNT(*) AS count FROM dialog_buffer WHERE synced = 0").get() as { count: number };
@@ -331,6 +344,13 @@ export class HybridMemory {
   private profileHotCache = new Map<number, { data: Record<string, unknown>; expiresAt: number }>();
   private economyMode = false;
   private sqliteOnly = false;
+  private zillizBlocked = false;
+  private alertCallback: ((msg: string) => void) | null = null;
+  private readonly autoScaler = new AutoScaler();
+
+  setAlertCallback(cb: (msg: string) => void): void {
+    this.alertCallback = cb;
+  }
 
   start(): void {
     this.guardian.startHealthLoop([this.qdrant, this.zilliz]);
@@ -433,7 +453,19 @@ export class HybridMemory {
   }
 
   getStats(): Record<string, unknown> {
-    return { guardian: this.guardian.getStats(), qdrant: this.qdrant.getMetrics(), zilliz: this.zilliz.getMetrics(), embeddingDimensions: EMBEDDING_DIM, pendingBatch: this.pending.length, economyMode: this.economyMode, sqliteOnly: this.sqliteOnly, sqliteBytes: this.guardian.getDbSizeBytes() };
+    return {
+      guardian: this.guardian.getStats(),
+      qdrant: this.qdrant.getMetrics(),
+      zilliz: this.zilliz.getMetrics(),
+      embeddingDimensions: EMBEDDING_DIM,
+      pendingBatch: this.pending.length,
+      economyMode: this.economyMode,
+      sqliteOnly: this.sqliteOnly,
+      zillizBlocked: this.zillizBlocked,
+      sqliteBytes: this.guardian.getDbSizeBytes(),
+      autoscaler: this.autoScaler.getLastState(),
+      estimatedStorage: this.guardian.estimateExternalStorageMb(),
+    };
   }
 
   private async embed(text: string): Promise<number[]> {
@@ -531,6 +563,15 @@ export class HybridMemory {
   }
 
   private async writeZilliz(collection: string, points: Array<{ id: string; vector: number[]; payload: Record<string, unknown> }>): Promise<void> {
+    if (this.zillizBlocked) {
+      // In emergency/critical state: only allow profile writes, block dialogs/archive
+      const profileOnly = collection === "user_profiles";
+      if (!profileOnly) {
+        logger.warn({ collection, points: points.length }, "Zilliz write blocked by AutoScaler — queuing to SQLite");
+        for (const p of points) this.guardian.enqueue("zilliz", "blocked_archive", p);
+        return;
+      }
+    }
     await this.zilliz.request("insert", "/v2/vectordb/entities/insert", {
       method: "POST",
       body: JSON.stringify({ collectionName: collection, data: points.map(p => ({ id: p.id, vector: p.vector, ...p.payload })) }),
@@ -554,33 +595,25 @@ export class HybridMemory {
 
   private async autoscale(): Promise<void> {
     const sqliteMb = this.guardian.getDbSizeBytes() / 1024 / 1024;
-    const qdrantQuota = Number(process.env["QDRANT_QUOTA_MB"] ?? 1000);
-    const zillizQuota = Number(process.env["ZILLIZ_QUOTA_MB"] ?? 5000);
-    const qdrantLatency = this.qdrant.getMetrics().latencyMs;
-    const zillizLatency = this.zilliz.getMetrics().latencyMs;
-    const latency = Math.max(qdrantLatency, zillizLatency);
-    if (latency > 200) {
-      this.guardian.log("warn", "vector search latency high", { latency, qdrantLatency, zillizLatency });
-    }
-    if (sqliteMb > 70) {
-      this.economyMode = true;
-      this.guardian.log("warn", "SQLite guardian approaching soft limit", { sqliteMb });
-    }
-    if (sqliteMb > 95) {
-      this.sqliteOnly = true;
-      this.guardian.log("error", "SQLite guardian near hard limit, external writes paused", { sqliteMb });
-    }
-    if (qdrantQuota <= 0 || zillizQuota <= 0) return;
-    this.guardian.setState("autoscaler", {
-      sqliteMb,
-      qdrantQuota,
-      zillizQuota,
-      qdrantStatus: this.qdrant.getMetrics().status,
-      zillizStatus: this.zilliz.getMetrics().status,
-      economyMode: this.economyMode,
-      sqliteOnly: this.sqliteOnly,
-      updatedAt: nowIso(),
-    });
+    const qdrantQuotaMb = Number(process.env["QDRANT_QUOTA_MB"] ?? 1000);
+    const zillizQuotaMb = Number(process.env["ZILLIZ_QUOTA_MB"] ?? 5000);
+    const { qdrantMb, zillizMb } = this.guardian.estimateExternalStorageMb();
+    const qdrantLatencyMs = this.qdrant.getMetrics().latencyMs;
+    const zillizLatencyMs = this.zilliz.getMetrics().latencyMs;
+
+    const state = this.autoScaler.evaluate(
+      { qdrantMb, qdrantQuotaMb, zillizMb, zillizQuotaMb, sqliteMb, qdrantLatencyMs, zillizLatencyMs },
+      {
+        setEconomyMode: (on) => { this.economyMode = on; },
+        setSqliteOnly: (on) => { this.sqliteOnly = on; },
+        setZillizBlocked: (on) => { this.zillizBlocked = on; },
+        alertAdmin: (msg) => { this.alertCallback?.(msg); },
+        log: (level, message, meta) => { this.guardian.log(level, message, meta ?? {}); },
+      },
+    );
+
+    this.guardian.setState("autoscaler", state);
+    logger.debug({ state }, "AutoScaler evaluated");
   }
 }
 

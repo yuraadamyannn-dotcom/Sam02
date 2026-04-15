@@ -81,6 +81,12 @@ const BOT_POLLING = process.env["BOT_POLLING"] === "true";
 const bot = new TelegramBot(token, { polling: BOT_POLLING });
 const groq = new Groq({ apiKey: groqKey });
 const eleven = elevenKey ? new ElevenLabsClient({ apiKey: elevenKey }) : null;
+// Wire AutoScaler alert callback: AutoScaler alerts go through the bot to the owner
+hybridMemory.setAlertCallback((msg) => {
+  const ownerId = Number(process.env["ADMIN_TELEGRAM_ID"] ?? 0);
+  if (!ownerId) return;
+  void bot.sendMessage(ownerId, msg, { parse_mode: "HTML" }).catch(() => {});
+});
 hybridMemory.start();
 codeGuardian.start(bot);
 
@@ -2436,6 +2442,8 @@ bot.onText(/^\/status(?:\s|$)/, async (msg) => {
   const m = Math.floor((uptime % 3600) / 60);
   const memoryStats = hybridMemory.getStats();
   const guardianStats = codeGuardian.getStats();
+  const autoscaler = (memoryStats as any).autoscaler as Record<string, string> | null;
+  const fixStats = (guardianStats as any).fixLearner as { errorsThisWeek: number; fixesApplied: number; fixesSucceeded: number } | undefined;
   const text = [
     `🤖 <b>Статус бота</b>`,
     `⏱ Аптайм: ${h}ч ${m}м`,
@@ -2443,10 +2451,13 @@ bot.onText(/^\/status(?:\s|$)/, async (msg) => {
     `🔊 ElevenLabs: ${eleven ? "✅" : "❌"}`,
     `🧠 Groq: ✅`,
     `🗃 DB: ✅`,
-    `🧬 Qdrant: ${escapeHtml(String((memoryStats as any).qdrant?.status ?? "unknown"))}`,
-    `🧊 Zilliz: ${escapeHtml(String((memoryStats as any).zilliz?.status ?? "unknown"))}`,
-    `🛡 Guardian: ${escapeHtml(JSON.stringify({ recentErrors: (guardianStats as any).recentErrors, rateLimiter: (guardianStats as any).rateLimiter }).slice(0, 900))}`,
-  ].join("\n");
+    `🧬 Qdrant: ${escapeHtml(String((memoryStats as any).qdrant?.status ?? "unknown"))} [${escapeHtml(String(autoscaler?.qdrantAction ?? "—"))}]`,
+    `🧊 Zilliz: ${escapeHtml(String((memoryStats as any).zilliz?.status ?? "unknown"))} [${escapeHtml(String(autoscaler?.zillizAction ?? "—"))}]`,
+    `📦 SQLite: ${escapeHtml(String(autoscaler?.sqliteAction ?? "—"))} | Economy: ${(memoryStats as any).economyMode ? "✅" : "❌"} | ZillizBlocked: ${(memoryStats as any).zillizBlocked ? "⛔" : "✅"}`,
+    `🛡 Guardian: ошибок/ч ${JSON.stringify((guardianStats as any).recentErrors ?? []).slice(0, 300)}`,
+    fixStats ? `🧠 FixLearner: ${fixStats.errorsThisWeek} событий, ${fixStats.fixesSucceeded}/${fixStats.fixesApplied} успешных фиксов за 7д` : "",
+    `Команды: /report /fix_stats /memory_stats /analyze /rollback`,
+  ].filter(Boolean).join("\n");
   await bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
 });
 
@@ -2477,6 +2488,32 @@ bot.onText(/^\/rollback(?:\s+(\S+))?/, async (msg, match) => {
   if (!isOwner(msg.from?.id ?? 0)) return;
   const ok = codeGuardian.rollbackLastFix(match?.[1]);
   await bot.sendMessage(msg.chat.id, ok ? "rollback выполнен" : "не нашёл патч для отката", { reply_to_message_id: msg.message_id });
+});
+
+// /report — weekly summary report on demand
+bot.onText(/^\/report(?:\s|$)/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const report = codeGuardian.weeklyReporter.buildReportNow();
+  await bot.sendMessage(msg.chat.id, report, { parse_mode: "HTML" });
+});
+
+// /fix_stats — FixLearner statistics and known fix patterns
+bot.onText(/^\/fix_stats(?:\s|$)/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const stats = codeGuardian.fixLearner.getWeeklyStats();
+  const topFixes = codeGuardian.fixLearner.getTopFixes(8);
+  const lines = [
+    `🧠 <b>FixLearner — статистика за 7 дней</b>`,
+    `Событий: <code>${stats.errorsThisWeek}</code>`,
+    `Применено фиксов: <code>${stats.fixesApplied}</code>`,
+    `Успешно: <code>${stats.fixesSucceeded}</code>`,
+    ``,
+    `📋 <b>Известные паттерны (топ ${topFixes.length}):</b>`,
+    ...topFixes.map(f =>
+      `• <code>${escapeHtml(f.errorPattern)}</code> → ${escapeHtml(f.fixDescription.slice(0, 60))} [✅${f.successCount} ❌${f.failureCount}]`
+    ),
+  ];
+  await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "HTML" });
 });
 
 // /danni

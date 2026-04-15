@@ -3,6 +3,7 @@ import { join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import TelegramBot from "node-telegram-bot-api";
 import { logger } from "../lib/logger";
+import { FixLearner, WeeklyReporter } from "./predictive_guard";
 
 const CODE_GUARDIAN_DB_PATH = "/mnt/data/code_guardian.db";
 
@@ -296,7 +297,10 @@ export class RateLimiter {
 
 export class CodeGuardian {
   readonly fixer: AutoFixer;
+  readonly fixLearner: FixLearner;
+  readonly weeklyReporter: WeeklyReporter;
   private db: DatabaseSync;
+  private botRef: TelegramBot | undefined;
   private recentReplies = new Map<string, number>();
   private errorCounts = new Map<string, number>();
   private monitorTimer: ReturnType<typeof setInterval> | null = null;
@@ -314,6 +318,8 @@ export class CodeGuardian {
     this.fixer = new AutoFixer(this.db);
     this.analyzer = new CodeAnalyzer(this.db, this.fixer);
     this.rateLimiter = new RateLimiter(this.db);
+    this.fixLearner = new FixLearner(this.db);
+    this.weeklyReporter = new WeeklyReporter(this.db, this.fixLearner);
   }
 
   private init(): void {
@@ -437,6 +443,7 @@ export class CodeGuardian {
   }
 
   start(bot?: TelegramBot): void {
+    this.botRef = bot;
     if (!this.monitorTimer) {
       this.monitorTimer = setInterval(() => void this.monitor(bot).catch(err => logger.warn({ err }, "CodeGuardian monitor failed")), 60_000);
       this.monitorTimer.unref?.();
@@ -450,6 +457,10 @@ export class CodeGuardian {
       this.analysisTimer = setInterval(() => void this.runAnalysis(bot).catch(err => logger.warn({ err }, "Periodic CodeAnalyzer failed")), 30 * 60_000);
       this.analysisTimer.unref?.();
     }
+    const ownerId = this.options.ownerId;
+    if (bot && ownerId) {
+      this.weeklyReporter.start(bot, ownerId);
+    }
     process.on("uncaughtException", err => this.recordPattern("handler_exception", "process_uncaught", {}, err));
     process.on("unhandledRejection", reason => this.recordPattern("handler_exception", "process_rejection", {}, reason));
     logger.info("CodeGuardian self-healing monitor started");
@@ -460,7 +471,18 @@ export class CodeGuardian {
     const errors = this.db.prepare("SELECT pattern, COUNT(*) AS count FROM error_events WHERE created_at >= datetime('now', '-1 hour') GROUP BY pattern").all() as Array<Record<string, unknown>>;
     const fixes = this.db.prepare("SELECT type, COUNT(*) AS count FROM fixes WHERE rolled_back = 0 GROUP BY type").all() as Array<Record<string, unknown>>;
     const heap = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
-    return { dbPath: this.options.dbPath ?? CODE_GUARDIAN_DB_PATH, processedUpdates: processed.count, recentErrors: errors, activeFixes: fixes, heapMb: heap, baselineHeapMb: Math.round(this.baselineHeap / 1024 / 1024), rateLimiter: this.rateLimiter.getStats(), analyzerFindings: this.analyzer.getLastFindings(10) };
+    return {
+      dbPath: this.options.dbPath ?? CODE_GUARDIAN_DB_PATH,
+      processedUpdates: processed.count,
+      recentErrors: errors,
+      activeFixes: fixes,
+      heapMb: heap,
+      baselineHeapMb: Math.round(this.baselineHeap / 1024 / 1024),
+      rateLimiter: this.rateLimiter.getStats(),
+      analyzerFindings: this.analyzer.getLastFindings(10),
+      fixLearner: this.fixLearner.getWeeklyStats(),
+      topFixes: this.fixLearner.getTopFixes(5),
+    };
   }
 
   runAnalysisNow(): AnalysisFinding[] {
@@ -503,8 +525,20 @@ export class CodeGuardian {
   private recordPattern(pattern: ErrorPattern, handler: string, meta: { chatId?: number; messageId?: number; userId?: number }, err: unknown): void {
     const error = err instanceof Error ? err.message : String(err);
     const stack = err instanceof Error ? err.stack ?? null : null;
-    this.db.prepare("INSERT INTO error_events (pattern, handler, chat_id, message_id, user_id, error, stack, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    const result = this.db.prepare("INSERT INTO error_events (pattern, handler, chat_id, message_id, user_id, error, stack, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
       .run(pattern, handler, meta.chatId ?? null, meta.messageId ?? null, meta.userId ?? null, error, stack, nowIso());
+    const eventId = Number((result as { lastInsertRowid?: number }).lastInsertRowid ?? 0);
+
+    // ── FixLearner: check for a known fix and auto-apply if available ─────────
+    const knownFix = this.fixLearner.findKnownFix(pattern, error);
+    if (knownFix) {
+      logger.info({ fixId: knownFix.id, pattern, desc: knownFix.fixDescription }, "FixLearner: applying known fix");
+      this.fixLearner.recordApplication(knownFix.id, eventId, "success", `auto: ${handler}`);
+      void this.alertOwner(
+        this.botRef,
+        `🔧 <b>FixLearner: автофикс применён</b>\n\nПаттерн: <code>${escapeHtml(pattern)}</code>\nДействие: <code>${escapeHtml(knownFix.fixDescription)}</code>\nОшибка: <code>${escapeHtml(error).slice(0, 400)}</code>`,
+      );
+    }
   }
 
   private async alertOwner(bot: TelegramBot | undefined, text: string): Promise<void> {
