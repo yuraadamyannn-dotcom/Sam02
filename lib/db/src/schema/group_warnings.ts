@@ -1,4 +1,4 @@
-import { pgTable, serial, bigint, text, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, serial, bigint, text, timestamp, index } from "drizzle-orm/pg-core";
 
 export const groupWarningsTable = pgTable("group_warnings", {
   id: serial("id").primaryKey(),
@@ -7,6 +7,8 @@ export const groupWarningsTable = pgTable("group_warnings", {
   reason: text("reason"),
   issuedBy: bigint("issued_by", { mode: "number" }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (table) => [
+  index("gw_group_user_idx").on(table.groupId, table.userId),
+]);
 
 export type GroupWarning = typeof groupWarningsTable.$inferSelect;

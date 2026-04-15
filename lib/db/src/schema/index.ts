@@ -1,4 +1,5 @@
 export * from "./telegram_users";
+export * from "./bot_processed_commands";
 export * from "./user_memory";
 export * from "./scheduled_messages";
 export * from "./bot_stickers";

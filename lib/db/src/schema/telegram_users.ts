@@ -1,4 +1,4 @@
-import { pgTable, bigint, text, integer, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, bigint, text, integer, timestamp, index } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
@@ -10,7 +10,9 @@ export const telegramUsersTable = pgTable("telegram_users", {
   messageCount: integer("message_count").notNull().default(0),
   firstSeen: timestamp("first_seen", { withTimezone: true }).notNull().defaultNow(),
   lastSeen: timestamp("last_seen", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (table) => [
+  index("tu_last_seen_idx").on(table.lastSeen),
+]);
 
 export const insertTelegramUserSchema = createInsertSchema(telegramUsersTable).omit({
   firstSeen: true,

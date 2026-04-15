@@ -1,4 +1,4 @@
-import { pgTable, serial, bigint, text, real, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, serial, bigint, text, real, timestamp, index } from "drizzle-orm/pg-core";
 
 export const messageLogTable = pgTable("message_log", {
   id: serial("id").primaryKey(),
@@ -8,6 +8,9 @@ export const messageLogTable = pgTable("message_log", {
   text: text("text").notNull(),
   sentiment: real("sentiment"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (table) => [
+  index("ml_chat_ts_idx").on(table.chatId, table.createdAt),
+  index("ml_user_idx").on(table.userId),
+]);
 
 export type MessageLog = typeof messageLogTable.$inferSelect;

@@ -1,4 +1,4 @@
-import { pgTable, serial, bigint, text, integer, boolean, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, serial, bigint, text, integer, boolean, timestamp, index } from "drizzle-orm/pg-core";
 
 export const chatEventsTable = pgTable("chat_events", {
   id: serial("id").primaryKey(),
@@ -10,6 +10,9 @@ export const chatEventsTable = pgTable("chat_events", {
   resolved: boolean("resolved").notNull().default(false),
   context: text("context"), // what led to this
   recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (table) => [
+  index("ce_chat_ts_idx").on(table.chatId, table.recordedAt),
+  index("ce_chat_type_idx").on(table.chatId, table.eventType),
+]);
 
 export type ChatEvent = typeof chatEventsTable.$inferSelect;

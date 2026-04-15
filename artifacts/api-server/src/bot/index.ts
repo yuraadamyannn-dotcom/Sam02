@@ -515,11 +515,24 @@ async function sendWithTyping(chatId: number, text: string, opts?: TelegramBot.S
     await bot.sendChatAction(chatId, "typing").catch(() => {});
     await sleep(Math.min(chunkSize, delay - i * chunkSize));
   }
-  await bot.sendMessage(chatId, text, opts).then(() => {
-    codeGuardian.recordBotReply(chatId, undefined, opts?.reply_to_message_id);
-  }).catch((err) => {
-    logger.error({ err, chatId }, "sendMessage failed");
-  });
+  // Retry once on Telegram 429 (Too Many Requests) using the retry_after hint
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await bot.sendMessage(chatId, text, opts);
+      codeGuardian.recordBotReply(chatId, undefined, opts?.reply_to_message_id);
+      return;
+    } catch (err: unknown) {
+      const retryAfter = (err as { response?: { body?: { parameters?: { retry_after?: number } } } })
+        ?.response?.body?.parameters?.retry_after;
+      if (typeof retryAfter === "number" && attempt === 0) {
+        logger.warn({ chatId, retryAfter }, "sendWithTyping: Telegram 429 — waiting retry_after");
+        await sleep(retryAfter * 1000 + 500);
+        continue;
+      }
+      logger.error({ err, chatId }, "sendMessage failed");
+      return;
+    }
+  }
 }
 
 function tmpFile(ext: string): string {
@@ -3229,6 +3242,50 @@ logger.info("Telegram bot started — full feature set enabled");
 // ─── Запуск агента самомониторинга ────────────────────────────────────────────
 
 startMonitor(bot, groqKey, BOT_OWNER_ID);
+
+// ─── Inactive data purge (Protection #6 — DataIntegrity PostgreSQL) ──────────
+// Deletes user_memory for users inactive > 6 months with low message count.
+// Runs once 5 min after start, then every 24 hours.
+
+async function purgeInactiveData(): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - 180 * 24 * 60 * 60_000); // 6 months ago
+    // Find inactive low-activity users
+    const inactive = await db
+      .select({ userId: telegramUsersTable.userId, messageCount: telegramUsersTable.messageCount })
+      .from(telegramUsersTable)
+      .where(
+        sql`${telegramUsersTable.lastSeen} < ${cutoff} AND ${telegramUsersTable.messageCount} < 10`
+      );
+
+    if (inactive.length === 0) return;
+
+    const inactiveIds = inactive.map(u => u.userId);
+
+    // Delete their user_memory entries to free space
+    const deleted = await db
+      .delete(userMemoryTable)
+      .where(sql`${userMemoryTable.userId} = ANY(${sql.raw(`ARRAY[${inactiveIds.join(",")}]::bigint[]`)})`)
+      .returning({ userId: userMemoryTable.userId });
+
+    if (deleted.length > 0) {
+      logger.info({ purged: deleted.length, inactiveUsers: inactive.length }, "purgeInactiveData: cleaned user_memory for inactive users");
+      codeGuardian.dataIntegrity.audit(
+        "purge_inactive",
+        "user_memory",
+        "ok",
+        `Removed ${deleted.length} memory records for ${inactive.length} users inactive >6 months`,
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, "purgeInactiveData: failed (non-fatal)");
+  }
+}
+
+// First run: 5 minutes after start (bot needs time to settle)
+setTimeout(() => void purgeInactiveData(), 5 * 60_000);
+// Subsequent runs: every 24 hours
+setInterval(() => void purgeInactiveData(), 24 * 60 * 60_000).unref();
 
 // ─── API-эндпоинт для агента (регистрируем глобально для app.ts) ─────────────
 

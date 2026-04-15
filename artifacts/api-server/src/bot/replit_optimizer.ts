@@ -305,11 +305,32 @@ export class MessageQueue {
       if (!msg) return;
       // Drop stale proactive messages (> 2 min old)
       if (msg.priority === "proactive" && Date.now() - msg.enqueuedAt > 2 * 60_000) return;
-      await this.bot.sendMessage(msg.chatId, msg.text, msg.opts as TelegramBot.SendMessageOptions).catch(err => {
+      try {
+        await this.bot.sendMessage(msg.chatId, msg.text, msg.opts as TelegramBot.SendMessageOptions);
+      } catch (err: unknown) {
+        // Handle Telegram 429: re-queue after retry_after delay
+        const retryAfter = (err as { response?: { body?: { parameters?: { retry_after?: number } } } })
+          ?.response?.body?.parameters?.retry_after;
         msg.attempts++;
-        if (msg.attempts < 3 && msg.priority !== "proactive") this.queue.unshift(msg); // re-queue non-proactive
+        if (typeof retryAfter === "number") {
+          logger.warn({ chatId: msg.chatId, retryAfter }, "MessageQueue: Telegram 429 — pausing queue");
+          if (msg.priority !== "proactive") this.queue.unshift(msg);
+          // Pause the flush timer briefly to respect the rate limit
+          if (this.flushTimer) {
+            clearInterval(this.flushTimer);
+            this.flushTimer = null;
+            setTimeout(() => {
+              if (!this.flushTimer) {
+                this.flushTimer = setInterval(() => void this.flush(), 200);
+                this.flushTimer.unref?.();
+              }
+            }, retryAfter * 1000 + 500);
+          }
+          return;
+        }
+        if (msg.attempts < 3 && msg.priority !== "proactive") this.queue.unshift(msg);
         logger.warn({ err, chatId: msg.chatId, attempts: msg.attempts }, "MessageQueue: send failed");
-      });
+      }
     } finally {
       this.flushing = false;
     }
