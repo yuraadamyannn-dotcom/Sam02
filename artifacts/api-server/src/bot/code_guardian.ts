@@ -4,6 +4,8 @@ import { DatabaseSync } from "node:sqlite";
 import TelegramBot from "node-telegram-bot-api";
 import { logger } from "../lib/logger";
 import { FixLearner, WeeklyReporter } from "./predictive_guard";
+import { SecurityGuard } from "./security_guard";
+import { DataIntegrity } from "./data_integrity";
 
 const CODE_GUARDIAN_DB_PATH = "/mnt/data/code_guardian.db";
 
@@ -299,6 +301,8 @@ export class CodeGuardian {
   readonly fixer: AutoFixer;
   readonly fixLearner: FixLearner;
   readonly weeklyReporter: WeeklyReporter;
+  readonly securityGuard: SecurityGuard;
+  readonly dataIntegrity: DataIntegrity;
   private db: DatabaseSync;
   private botRef: TelegramBot | undefined;
   private recentReplies = new Map<string, number>();
@@ -320,6 +324,8 @@ export class CodeGuardian {
     this.rateLimiter = new RateLimiter(this.db);
     this.fixLearner = new FixLearner(this.db);
     this.weeklyReporter = new WeeklyReporter(this.db, this.fixLearner);
+    this.securityGuard = new SecurityGuard(this.db);
+    this.dataIntegrity = new DataIntegrity(this.db);
   }
 
   private init(): void {
@@ -460,6 +466,12 @@ export class CodeGuardian {
     const ownerId = this.options.ownerId;
     if (bot && ownerId) {
       this.weeklyReporter.start(bot, ownerId);
+      // Wire DataIntegrity alerts to the bot owner
+      this.dataIntegrity.start((msg: string) => {
+        bot.sendMessage(ownerId, msg, { parse_mode: "HTML" }).catch(() => {});
+      });
+    } else {
+      this.dataIntegrity.start();
     }
     process.on("uncaughtException", err => this.recordPattern("handler_exception", "process_uncaught", {}, err));
     process.on("unhandledRejection", reason => this.recordPattern("handler_exception", "process_rejection", {}, reason));
@@ -482,6 +494,8 @@ export class CodeGuardian {
       analyzerFindings: this.analyzer.getLastFindings(10),
       fixLearner: this.fixLearner.getWeeklyStats(),
       topFixes: this.fixLearner.getTopFixes(5),
+      security: this.securityGuard.getStats(),
+      dataIntegrity: this.dataIntegrity.getStats(),
     };
   }
 

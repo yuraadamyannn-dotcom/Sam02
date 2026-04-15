@@ -66,6 +66,7 @@ import {
 import { detectWhisper, handleWhisper, handleWhisperCallback, isWhisperCommand } from "./whisper";
 import { hybridMemory } from "./hybrid_memory";
 import { codeGuardian } from "./code_guardian";
+import { ReplitOptimizer, DependencyGuard, MessageQueue } from "./replit_optimizer";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
@@ -89,6 +90,46 @@ hybridMemory.setAlertCallback((msg) => {
 });
 hybridMemory.start();
 codeGuardian.start(bot);
+
+// ── ReplitOptimizer: RAM monitor + keep-alive + graceful shutdown ─
+const replitOptimizer = new ReplitOptimizer();
+replitOptimizer.start({
+  selfPingUrl: process.env["REPLIT_DEV_DOMAIN"] ? `https://${process.env["REPLIT_DEV_DOMAIN"]}/health` : undefined,
+  selfPingIntervalMs: 5 * 60_000,
+  onHighMemory: () => {
+    // clear non-critical caches
+    if (global.gc) global.gc();
+  },
+  onCriticalMemory: () => {
+    if (global.gc) global.gc();
+    const ownerId = Number(process.env["ADMIN_TELEGRAM_ID"] ?? 0);
+    if (ownerId) void bot.sendMessage(ownerId, "🚨 <b>Критическая память!</b> Бот может упасть. Проверь /resource_stats", { parse_mode: "HTML" }).catch(() => {});
+  },
+  alertCallback: (msg) => {
+    const ownerId = Number(process.env["ADMIN_TELEGRAM_ID"] ?? 0);
+    if (ownerId) void bot.sendMessage(ownerId, msg, { parse_mode: "HTML" }).catch(() => {});
+  },
+});
+replitOptimizer.setupGracefulShutdown({
+  bot,
+  adminChatId: Number(process.env["ADMIN_TELEGRAM_ID"] ?? 0) || undefined,
+  onShutdown: async () => {
+    hybridMemory.stop?.();
+    logger.info("Graceful shutdown: caches flushed, connections closed");
+  },
+  timeoutMs: 10_000,
+});
+
+// ── DependencyGuard: check critical package versions at startup ───
+const depGuard = new DependencyGuard(process.cwd());
+const depResult = depGuard.checkVersions();
+if (!depResult.ok) {
+  logger.warn({ mismatches: depResult.mismatches }, "DependencyGuard: version mismatches detected");
+}
+
+// ── MessageQueue: priority outgoing message queue ─────────────────
+const messageQueue = new MessageQueue(500);
+messageQueue.attach(bot);
 
 // Bot identity — resolved async once on startup
 let BOT_ID = 0;
@@ -2516,6 +2557,84 @@ bot.onText(/^\/fix_stats(?:\s|$)/, async (msg) => {
   await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "HTML" });
 });
 
+// /security_stats — SecurityGuard violations and blacklist overview
+bot.onText(/^\/security_stats(?:\s|$)/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const stats = codeGuardian.securityGuard.getStats();
+  const bl = codeGuardian.securityGuard.getBlacklist().slice(0, 10);
+  const lines = [
+    `🛡 <b>SecurityGuard — статистика</b>`,
+    `Всего нарушений: <code>${stats.totalViolations}</code>`,
+    `Заблокированных пользователей: <code>${stats.blacklistedUsers}</code>`,
+    `За последний час:`,
+    `  • Инъекций: <code>${stats.recentInjections}</code>`,
+    `  • Флуда: <code>${stats.recentFloods}</code>`,
+    `  • Переполнений: <code>${stats.recentOverflows}</code>`,
+    bl.length ? `\n📋 <b>Чёрный список (топ ${bl.length}):</b>` : "",
+    ...bl.map(u => `• <code>${u.userId}</code> — ${escapeHtml(u.reason.slice(0, 60))} [${u.violationCount} нар.]`),
+    `\nКоманды: /unblacklist &lt;user_id&gt;`,
+  ].filter(Boolean).join("\n");
+  await bot.sendMessage(msg.chat.id, lines, { parse_mode: "HTML" });
+});
+
+// /unblacklist <user_id> — remove user from security blacklist
+bot.onText(/^\/unblacklist\s+(\d+)/, async (msg, match) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const userId = parseInt(match?.[1] ?? "0");
+  if (!userId) { await bot.sendMessage(msg.chat.id, "Укажи user_id: /unblacklist 123456789"); return; }
+  const ok = codeGuardian.securityGuard.unblacklist(userId);
+  await bot.sendMessage(msg.chat.id, ok ? `✅ Пользователь <code>${userId}</code> разблокирован.` : `❌ <code>${userId}</code> не найден в чёрном списке.`, { parse_mode: "HTML" });
+});
+
+// /integrity_check — run SQLite integrity check + VACUUM on demand
+bot.onText(/^\/integrity_check(?:\s|$)/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  await bot.sendMessage(msg.chat.id, "🔍 Запускаю проверку целостности данных...");
+  const result = codeGuardian.dataIntegrity.runFullCheck();
+  const diStats = codeGuardian.dataIntegrity.getStats() as { recentChecks?: Array<Record<string, unknown>> };
+  const lines = [
+    result.ok ? "✅ <b>DataIntegrity: всё в порядке</b>" : `⚠️ <b>DataIntegrity: найдены проблемы (${result.issues.length})</b>`,
+    result.issues.length ? `\nПроблемы:\n` + result.issues.slice(0, 5).map(i => `• ${escapeHtml(i)}`).join("\n") : "",
+    result.vacuumed ? `\n🗜 VACUUM выполнен, освобождено <code>${result.vacuumSavedMb?.toFixed(1) ?? 0} MB</code>` : "\nVACUUM не требовался (< 50 MB)",
+    `\nПоследних проверок: ${(diStats.recentChecks ?? []).length}`,
+  ].filter(Boolean).join("\n");
+  await bot.sendMessage(msg.chat.id, lines, { parse_mode: "HTML" });
+});
+
+// /resource_stats — ReplitOptimizer memory and uptime stats
+bot.onText(/^\/resource_stats(?:\s|$)/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const stats = replitOptimizer.getStats();
+  const qStats = messageQueue.getStats();
+  const lines = [
+    `⚙️ <b>ReplitOptimizer — ресурсы</b>`,
+    `Heap: <code>${stats["heapMb"]} MB / ${stats["heapTotalMb"]} MB (${stats["pct"]}%)</code>`,
+    `RSS: <code>${stats["rssMb"]} MB</code>`,
+    `Аптайм: <code>${stats["uptimeH"]} ч</code>`,
+    `Высокая память: ${stats["highMemory"] ? "⚠️ да" : "✅ нет"}`,
+    `Критическая: ${stats["criticalMemory"] ? "🚨 да" : "✅ нет"}`,
+    `Shutdown: ${stats["isShuttingDown"] ? "⚙️ в процессе" : "✅ нет"}`,
+    ``,
+    `📬 <b>MessageQueue</b>`,
+    `В очереди: <code>${qStats.queued}</code>`,
+    `Admin: ${qStats.breakdown["admin"]} | Error: ${qStats.breakdown["error"]} | Reply: ${qStats.breakdown["reply"]} | Proactive: ${qStats.breakdown["proactive"]}`,
+  ].join("\n");
+  await bot.sendMessage(msg.chat.id, lines, { parse_mode: "HTML" });
+});
+
+// /dep_check — DependencyGuard version check on demand
+bot.onText(/^\/dep_check(?:\s|$)/, async (msg) => {
+  if (!isOwner(msg.from?.id ?? 0)) return;
+  const result = depGuard.checkVersions();
+  const lines = [
+    result.ok ? `✅ <b>DependencyGuard: все версии совпадают</b>` : `⚠️ <b>DependencyGuard: несовпадения версий (${result.mismatches.length})</b>`,
+    `Проверено пакетов: <code>${result.checked}</code>`,
+    result.mismatches.length ? `\n❌ Несовпадения:\n` + result.mismatches.map(m => `• <code>${escapeHtml(m.name)}</code>: установлен <code>${m.installed}</code>, ожидается <code>${m.expected}</code>`).join("\n") : "",
+    result.warnings.length ? `\n⚠️ Предупреждения:\n` + result.warnings.map(w => `• ${escapeHtml(w)}`).join("\n") : "",
+  ].filter(Boolean).join("\n");
+  await bot.sendMessage(msg.chat.id, lines, { parse_mode: "HTML" });
+});
+
 // /danni
 bot.onText(/^\/danni(?:_chat)?(\s+.*)?$/, async (msg, match) => {
   if (!isOwner(msg.from?.id ?? 0)) {
@@ -2978,9 +3097,17 @@ bot.on("message", async (msg) => {
   if (!msg.from || codeGuardian.shouldIgnoreMessage(msg, BOT_ID)) return;
   if (!(await codeGuardian.allowMessage(msg, bot, isOwner(msg.from.id)))) return;
 
+  // ── SecurityGuard: sanitize + blacklist + flood + injection check ─
+  const secResult = codeGuardian.securityGuard.sanitizeInput(msg.text, msg.from?.id);
+  if (secResult.blocked) return; // silently ignore blacklisted/flooded users
+  if (replitOptimizer.shuttingDown) {
+    await bot.sendMessage(msg.chat.id, "⚙️ Бот перезагружается, подожди секунду...", { reply_to_message_id: msg.message_id }).catch(() => {});
+    return;
+  }
+
   const chatId = msg.chat.id;
   const from = msg.from;
-  const text = msg.text;
+  const text = secResult.text; // use sanitized + truncated text
   const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
 
   if (isGroup && isWhisperCommand(text)) {

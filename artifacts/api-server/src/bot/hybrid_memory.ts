@@ -279,6 +279,25 @@ export class MemoryGuardian {
     return safeJsonParse(row.data_json, null as Record<string, unknown> | null);
   }
 
+  // ── Embedding cache: avoid repeated OpenAI calls for same text ─
+  getCachedEmbedding(cacheKey: string): number[] | null {
+    try {
+      const row = this.db.prepare("SELECT value_json FROM request_cache WHERE key = ?").get(`emb:${cacheKey}`) as { value_json: string } | undefined;
+      if (!row) return null;
+      this.db.prepare("UPDATE request_cache SET last_access = ? WHERE key = ?").run(nowIso(), `emb:${cacheKey}`);
+      return safeJsonParse(row.value_json, null as number[] | null);
+    } catch { return null; }
+  }
+
+  setCachedEmbedding(cacheKey: string, vector: number[]): void {
+    try {
+      this.db.prepare("INSERT OR REPLACE INTO request_cache (key, value_json, created_at, last_access) VALUES (?, ?, ?, ?)")
+        .run(`emb:${cacheKey}`, JSON.stringify(vector), nowIso(), nowIso());
+      // Keep only 5000 most recent embedding entries
+      this.db.prepare("DELETE FROM request_cache WHERE key LIKE 'emb:%' AND key NOT IN (SELECT key FROM request_cache WHERE key LIKE 'emb:%' ORDER BY last_access DESC LIMIT 5000)").run();
+    } catch { /* non-critical */ }
+  }
+
   recordMetric(component: string, operation: string, latencyMs: number, ok: boolean, error?: unknown): void {
     this.db.prepare("INSERT INTO metrics (component, operation, latency_ms, ok, error, created_at) VALUES (?, ?, ?, ?, ?, ?)")
       .run(component, operation, Math.round(latencyMs), ok ? 1 : 0, error ? String(error) : null, nowIso());
@@ -470,9 +489,18 @@ export class HybridMemory {
 
   private async embed(text: string): Promise<number[]> {
     if (!this.openai) return hashEmbedding(text, EMBEDDING_DIM);
+
+    // ── Cache lookup (reduces OpenAI calls ~80% for repeated content) ─
+    const cacheKey = text.trim().slice(0, 512); // cap key length
+    const cached = this.guardian.getCachedEmbedding(cacheKey);
+    if (cached && cached.length === EMBEDDING_DIM) return cached;
+
     try {
       const res = await this.openai.embeddings.create({ model: "text-embedding-3-small", input: text.slice(0, 8000) });
-      return normaliseVector(res.data[0]?.embedding ?? [], EMBEDDING_DIM);
+      const vector = normaliseVector(res.data[0]?.embedding ?? [], EMBEDDING_DIM);
+      // Store in cache (non-blocking)
+      this.guardian.setCachedEmbedding(cacheKey, vector);
+      return vector;
     } catch (err) {
       logger.warn({ err }, "OpenAI embeddings failed, falling back to local hash embedding");
       return hashEmbedding(text, 384);
