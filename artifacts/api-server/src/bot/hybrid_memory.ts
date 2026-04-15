@@ -293,8 +293,8 @@ export class MemoryGuardian {
     try {
       this.db.prepare("INSERT OR REPLACE INTO request_cache (key, value_json, created_at, last_access) VALUES (?, ?, ?, ?)")
         .run(`emb:${cacheKey}`, JSON.stringify(vector), nowIso(), nowIso());
-      // Keep only 5000 most recent embedding entries
-      this.db.prepare("DELETE FROM request_cache WHERE key LIKE 'emb:%' AND key NOT IN (SELECT key FROM request_cache WHERE key LIKE 'emb:%' ORDER BY last_access DESC LIMIT 5000)").run();
+      // Keep only 2000 most recent embedding entries (~6 MB SQLite, down from ~15 MB)
+      this.db.prepare("DELETE FROM request_cache WHERE key LIKE 'emb:%' AND key NOT IN (SELECT key FROM request_cache WHERE key LIKE 'emb:%' ORDER BY last_access DESC LIMIT 2000)").run();
     } catch { /* non-critical */ }
   }
 
@@ -361,6 +361,7 @@ export class HybridMemory {
   private migrationTimer: ReturnType<typeof setInterval> | null = null;
   private autoscaleTimer: ReturnType<typeof setInterval> | null = null;
   private profileHotCache = new Map<number, { data: Record<string, unknown>; expiresAt: number }>();
+  private hotCacheTrimTimer: ReturnType<typeof setInterval> | null = null;
   private economyMode = false;
   private sqliteOnly = false;
   private zillizBlocked = false;
@@ -390,6 +391,36 @@ export class HybridMemory {
       this.autoscaleTimer.unref?.();
       setTimeout(() => void this.autoscale().catch(err => logger.warn({ err }, "Startup memory autoscaler failed")), 15_000).unref?.();
     }
+    // ── Hot-cache self-trim: evict expired profileHotCache entries every 5 min ─
+    if (!this.hotCacheTrimTimer) {
+      this.hotCacheTrimTimer = setInterval(() => this.trimCaches(false), 5 * 60_000);
+      this.hotCacheTrimTimer.unref?.();
+    }
+  }
+
+  /**
+   * Trim in-memory caches to reduce RSS.
+   * @param full  true = clear everything; false = only evict expired/excess entries
+   */
+  trimCaches(full = false): void {
+    if (full) {
+      this.profileHotCache.clear();
+      logger.info("HybridMemory.trimCaches: hot cache fully cleared");
+      return;
+    }
+    const now = Date.now();
+    let evicted = 0;
+    for (const [uid, entry] of this.profileHotCache) {
+      if (entry.expiresAt < now) { this.profileHotCache.delete(uid); evicted++; }
+    }
+    // If still large, keep only the 100 most recent (Map preserves insertion order)
+    if (this.profileHotCache.size > 100) {
+      const keys = [...this.profileHotCache.keys()];
+      for (const k of keys.slice(0, this.profileHotCache.size - 100)) {
+        this.profileHotCache.delete(k); evicted++;
+      }
+    }
+    if (evicted > 0) logger.debug({ evicted, remaining: this.profileHotCache.size }, "HybridMemory.trimCaches: hot cache trimmed");
   }
 
   async remember(userId: number, chatId: number, text: string, type: MemoryType = "dialog"): Promise<void> {

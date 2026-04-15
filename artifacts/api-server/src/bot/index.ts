@@ -97,13 +97,12 @@ replitOptimizer.start({
   selfPingUrl: process.env["REPLIT_DEV_DOMAIN"] ? `https://${process.env["REPLIT_DEV_DOMAIN"]}/health` : undefined,
   selfPingIntervalMs: 5 * 60_000,
   onHighMemory: () => {
-    // clear non-critical caches
+    hybridMemory.trimCaches(false); // evict expired hot-cache entries
     if (global.gc) global.gc();
   },
   onCriticalMemory: () => {
+    hybridMemory.trimCaches(true); // full hot-cache wipe
     if (global.gc) global.gc();
-    const ownerId = Number(process.env["ADMIN_TELEGRAM_ID"] ?? 0);
-    if (ownerId) void bot.sendMessage(ownerId, "🚨 <b>Критическая память!</b> Бот может упасть. Проверь /resource_stats", { parse_mode: "HTML" }).catch(() => {});
   },
   alertCallback: (msg) => {
     const ownerId = Number(process.env["ADMIN_TELEGRAM_ID"] ?? 0);

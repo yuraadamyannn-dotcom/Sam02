@@ -36,8 +36,9 @@ export class ReplitOptimizer {
   // Using RSS (Resident Set Size) — reflects actual process footprint, not V8 heap ratio.
   // heapUsed/heapTotal is unreliable: V8 starts with a small heapTotal (~130 MB) and
   // grows it on demand, so pct can read 98% even when the process is perfectly healthy.
-  private readonly HIGH_MEMORY_RSS_MB = 380;    // ~380 MB RSS → soft GC
-  private readonly CRITICAL_MEMORY_RSS_MB = 480; // ~480 MB RSS → alert + hard GC
+  // Bot normally sits at ~490 MB RSS under full load — thresholds adjusted accordingly.
+  private readonly HIGH_MEMORY_RSS_MB = 560;    // ~560 MB RSS → soft GC + cache trim
+  private readonly CRITICAL_MEMORY_RSS_MB = 680; // ~680 MB RSS → alert + hard GC + full trim
 
   start(opts: {
     selfPingUrl?: string;
@@ -50,9 +51,9 @@ export class ReplitOptimizer {
     this.onCriticalMemoryCb = opts.onCriticalMemory ?? null;
     this.alertCb = opts.alertCallback ?? null;
 
-    // ── Memory monitor: every 30 seconds ───────────────────────
+    // ── Memory monitor: every 60 seconds (30s was too frequent for normal load) ─
     if (!this.monitorTimer) {
-      this.monitorTimer = setInterval(() => this.checkMemory(), 30_000);
+      this.monitorTimer = setInterval(() => this.checkMemory(), 60_000);
       this.monitorTimer.unref?.();
     }
 
@@ -93,9 +94,9 @@ export class ReplitOptimizer {
       this.onCriticalMemoryCb?.();
       if (global.gc) global.gc();
       const now = Date.now();
-      if (now - this.lastHighMemAlert > 30 * 60_000) { // alert at most every 30 min
+      if (now - this.lastHighMemAlert > 60 * 60_000) { // alert at most every 60 min
         this.lastHighMemAlert = now;
-        this.alertCb?.(`🚨 <b>ReplitOptimizer: высокое потребление RAM</b>\nRSS: <code>${Math.round(rssMb)} MB</code> (порог ${this.CRITICAL_MEMORY_RSS_MB} MB)\nHeap: <code>${Math.round(heapUsedMb)} MB / ${Math.round(heapTotalMb)} MB</code>\nДействие: GC + очистка кэшей. Проверь /resource_stats`);
+        this.alertCb?.(`⚠️ <b>ReplitOptimizer: высокое потребление RAM</b>\nRSS: <code>${Math.round(rssMb)} MB</code> (порог ${this.CRITICAL_MEMORY_RSS_MB} MB)\nHeap: <code>${Math.round(heapUsedMb)} MB / ${Math.round(heapTotalMb)} MB</code>\nДействие: GC + сброс кэшей выполнен автоматически.`);
       }
     } else if (highMemory) {
       logger.warn({ rssMb: Math.round(rssMb), heapUsedMb: Math.round(heapUsedMb) }, "ReplitOptimizer: high memory (RSS)");
