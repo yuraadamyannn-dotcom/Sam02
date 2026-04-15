@@ -21,7 +21,6 @@ KEYS = [
     ("TELEGRAM_BOT_TOKEN",  "Telegram Bot Token (from @BotFather)", True),
     ("GROQ_API_KEY",        "Groq API Key (primary AI engine)", True),
     ("GEMINI_API_KEY",      "Gemini API Key (Python bot primary AI)", True),
-    ("GROK_API_KEY",        "Grok / xAI API Key (Python bot fallback AI)", True),
     ("ADMIN_TELEGRAM_ID",   "Admin Telegram User ID (your numeric Telegram ID)", True),
     ("ELEVENLABS_API_KEY",  "ElevenLabs API Key (TTS voice, optional)", False),
     ("OPENAI_API_KEY",      "OpenAI API Key (embeddings, optional)", False),
